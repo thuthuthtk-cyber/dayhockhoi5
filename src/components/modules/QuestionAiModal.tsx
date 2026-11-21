@@ -17,6 +17,8 @@ import {
 } from 'lucide-react';
 import { QUESTION_TYPES, getQuestionTypeLabel } from '../../lib/constants';
 import { cleanQuestionMath } from '../../utils/mathFormatter';
+import { auth, ensureFirebaseAuthSession } from '../../services/firebase';
+import { signInAnonymously } from 'firebase/auth';
 
 interface QuestionAiModalProps {
   isOpen: boolean;
@@ -138,7 +140,40 @@ export const QuestionAiModal: React.FC<QuestionAiModalProps> = ({
   EXAM_TYPES,
   blueprint,
 }) => {
+  const [isEnsuringAuth, setIsEnsuringAuth] = React.useState(false);
+
   if (!isOpen) return null;
+
+  const formatSaveErrorText = (rawErr: string | null): string | null => {
+    if (!rawErr) return null;
+    try {
+      const parsed = JSON.parse(rawErr);
+      if (parsed?.error) return String(parsed.error);
+    } catch {}
+    return rawErr;
+  };
+
+  const formattedSaveError = formatSaveErrorText(saveError);
+
+  const onConfirmSaveWithAuth = async () => {
+    if (isSaving || isEnsuringAuth || previewQuestions.length === 0) return;
+    setIsEnsuringAuth(true);
+    try {
+      if (auth && !auth.currentUser) {
+        try {
+          const user = await ensureFirebaseAuthSession();
+          if (!user && !auth.currentUser) {
+            await signInAnonymously(auth);
+          }
+        } catch (authErr) {
+          console.warn('Tự động đăng nhập ẩn danh trước khi lưu câu hỏi gặp lỗi:', authErr);
+        }
+      }
+      await Promise.resolve(handleConfirmSave());
+    } finally {
+      setIsEnsuringAuth(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm animate-fade-in">
@@ -371,7 +406,7 @@ D. Bàn phím cơ
                         }}
                         className="text-teal-700 font-bold hover:underline cursor-pointer"
                       >
-                        Dán nội dung mẫu Tin học 4
+                        Dán nội dung mẫu Tin học 5
                       </button>
                     </div>
                   </div>
@@ -543,13 +578,13 @@ D. Bàn phím cơ
                 </span>
               </div>
 
-              {saveError && (
+              {formattedSaveError && (
                 <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-xl text-xs text-amber-900 space-y-2.5 shadow-xs">
                   <div className="flex items-start gap-2.5 font-semibold">
                     <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
                     <div>
                       <div className="text-amber-900 font-bold text-sm">Ghi dữ liệu vào CSDL Firestore bị gián đoạn hoặc từ chối</div>
-                      <div className="font-medium text-xs text-amber-800 mt-1 break-words bg-white/70 p-2 rounded-lg border border-amber-200">{saveError}</div>
+                      <div className="font-medium text-xs text-amber-800 mt-1 break-words bg-white/70 p-2 rounded-lg border border-amber-200">{formattedSaveError}</div>
                     </div>
                   </div>
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-amber-200/60 text-[11px] text-amber-800">
@@ -670,20 +705,20 @@ D. Bàn phím cơ
 
                 <button
                   type="button"
-                  onClick={handleConfirmSave}
-                  disabled={previewQuestions.length === 0 || isSaving}
+                  onClick={onConfirmSaveWithAuth}
+                  disabled={previewQuestions.length === 0 || isSaving || isEnsuringAuth}
                   className={`px-5 py-2 text-xs font-semibold rounded-xl flex items-center gap-2 shadow-md cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed active:scale-98 transition-all ${
-                    saveError
+                    formattedSaveError
                       ? 'bg-amber-600 hover:bg-amber-700 text-white shadow-amber-200/80'
                       : 'bg-[#4F46E5] hover:bg-[#4338CA] text-white shadow-indigo-200/80'
                   }`}
                 >
-                  {isSaving ? (
+                  {isSaving || isEnsuringAuth ? (
                     <>
                       <Loader2 className="w-4 h-4 text-white animate-spin" />
                       <span>Đang lưu vào CSDL...</span>
                     </>
-                  ) : saveError ? (
+                  ) : formattedSaveError ? (
                     <>
                       <RotateCcw className="w-4 h-4 text-amber-100" />
                       <span>Thử lưu lại CSDL ({previewQuestions.length} câu)</span>

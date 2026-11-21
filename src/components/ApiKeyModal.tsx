@@ -18,7 +18,7 @@ interface ApiKeyModalProps {
 
 export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose }) => {
   const [apiKey, setApiKey] = useState('AIzaSyD-Studio-Runtime-Secure-Token-78x9');
-  const [model, setModel] = useState('gemini-2.5-flash');
+  const [model, setModel] = useState('gemini-4-hydrogen');
   const [isSaved, setIsSaved] = useState(false);
 
   if (!isOpen) return null;
@@ -93,8 +93,8 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose }) => 
               onChange={(e) => setModel(e.target.value)}
               className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
             >
-              <option value="gemini-2.5-flash">Gemini 2.5 Flash (Khuyên dùng - Phản hồi siêu tốc & tối ưu sư phạm)</option>
-              <option value="gemini-2.5-pro">Gemini 2.5 Pro (Suy luận sâu - Soạn ma trận đề thi phức tạp)</option>
+              <option value="gemini-4-hydrogen">Gemini 4 Hydrogen (Khuyên dùng - Phản hồi nhanh & ổn định)</option>
+              <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite (Mô hình nhẹ, tốc độ cao)</option>
             </select>
           </div>
 

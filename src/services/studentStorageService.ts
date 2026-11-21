@@ -1,5 +1,6 @@
 import { StudentRecord, StudentEnrollmentRecord } from '../types';
-import { db } from './firebase';
+import { db, ensureFirebaseAuthSession } from './firebase';
+import { handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, getDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch } from './firestoreWriteTracker';
 import { formatStandardStudentCode, normalizeStudentCode } from './studentCode';
@@ -715,6 +716,7 @@ export async function deleteStudentPermanently(
 
     // 3. Sync to Firestore
     if (db) {
+      await ensureFirebaseAuthSession();
       const maleCount = updated.filter((s) => s.gender === 'Nam').length;
       const femaleCount = updated.filter((s) => s.gender === 'Nữ').length;
 
@@ -825,6 +827,7 @@ export async function deleteStudentPermanently(
     const msg = String(err?.message || err || '');
     if (!msg.includes('INTERNAL ASSERTION FAILED') && !msg.includes('b815') && !msg.includes('ca9')) {
       console.error('Lỗi khi xóa học sinh:', err);
+      handleFirestoreError(err, OperationType.WRITE, 'class_rosters');
     }
     return { success: false, error: err?.message || String(err), remainingStudents: [] };
   }
@@ -841,6 +844,8 @@ export async function syncClassStudentsToFirestore(
     if (!db) {
       return { success: false, error: 'Chưa khởi tạo Firestore' };
     }
+
+    await ensureFirebaseAuthSession();
 
     const stdName = getStandardClassName(className);
     const classKey = normalizeClassKey(className);
@@ -892,6 +897,7 @@ export async function syncClassStudentsToFirestore(
 export async function fetchClassStudentsFromFirestore(className: string): Promise<StudentRecord[] | null> {
   try {
     if (!db) return null;
+    await ensureFirebaseAuthSession();
 
     const classKey = normalizeClassKey(className);
     let rosterRef = doc(db, 'class_rosters', classKey);
@@ -927,6 +933,7 @@ export async function fetchAllStudentsFromFirestore(): Promise<Record<string, St
   const allRosters: Record<string, StudentRecord[]> = {};
 
   try {
+    await ensureFirebaseAuthSession();
     // 1. Fetch all documents from 'class_rosters' collection in parallel
     const rostersSnap = await getDocs(collection(db, 'class_rosters'));
     if (!rostersSnap.empty) {

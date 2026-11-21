@@ -9,7 +9,7 @@ import {
   persistentSingleTabManager,
   Firestore
 } from "firebase/firestore";
-import { getAuth, Auth } from "firebase/auth";
+import { getAuth, Auth, signInAnonymously, User } from "firebase/auth";
 import firebaseAppletConfig from "../firebase-applet-config.json";
 
 export const firebaseConfig = {
@@ -55,6 +55,45 @@ export const db: Firestore = (() => {
 })();
 
 export const auth: Auth = getAuth(app);
+
+let pendingAnonymousAuthPromise: Promise<User | null> | null = null;
+let lastAuthErrorCode: string | null = null;
+
+export function getLastAuthErrorCode(): string | null {
+  return lastAuthErrorCode;
+}
+
+/**
+ * Tự động đảm bảo có phiên xác thực Firebase Auth trước khi thao tác Firestore.
+ * Nếu auth.currentUser đang null, gọi signInAnonymously(auth) trong try/catch.
+ */
+export async function ensureFirebaseAuthSession(): Promise<User | null> {
+  if (!auth) return null;
+  if (auth.currentUser) {
+    lastAuthErrorCode = null;
+    return auth.currentUser;
+  }
+
+  if (pendingAnonymousAuthPromise) {
+    return pendingAnonymousAuthPromise;
+  }
+
+  pendingAnonymousAuthPromise = (async () => {
+    try {
+      const cred = await signInAnonymously(auth);
+      lastAuthErrorCode = null;
+      return cred.user;
+    } catch (err: any) {
+      lastAuthErrorCode = err?.code || 'auth/anonymous-failed';
+      console.warn('[Firebase Auth] Không thể tự động đăng nhập ẩn danh (signInAnonymously):', lastAuthErrorCode, err?.message || err);
+      return auth.currentUser || null;
+    } finally {
+      pendingAnonymousAuthPromise = null;
+    }
+  })();
+
+  return pendingAnonymousAuthPromise;
+}
 
 // Bộ đếm số lần xảy ra Internal Assertion trong phiên
 export let sessionInternalAssertionCount = 0;

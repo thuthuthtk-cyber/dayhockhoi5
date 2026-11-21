@@ -2,40 +2,370 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
     function isSignedIn() {
       return request.auth != null;
     }
 
-    function isOwnerOrSchoolMember(userId) {
-      return isSignedIn();
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_.@\\-]+$');
+    }
+
+    function isBootstrappedAdminEmail() {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        (
+          request.auth.token.email == 'thuthuthtk@gmail.com' ||
+          request.auth.token.email == 'vanquan18189@gmail.com'
+        );
+    }
+
+    function isVerifiedAdmin() {
+      return isBootstrappedAdminEmail() || (
+        isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+
+    function isValidPayloadBase(data) {
+      return data is map && data.keys().size() > 0 && data.keys().size() <= 100;
+    }
+
+    function isValidUser(data) {
+      return isValidPayloadBase(data) &&
+        (!('uid' in data) || (data.uid is string && data.uid.size() <= 128)) &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
+        (!('email' in data) || (data.email is string && data.email.size() <= 200)) &&
+        (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 200)) &&
+        (!('name' in data) || (data.name is string && data.name.size() <= 200)) &&
+        (!('role' in data) || (data.role is string && data.role in ['admin', 'teacher', 'student']));
+    }
+
+    function isValidClassRoster(data) {
+      return isValidPayloadBase(data) &&
+        (!('className' in data) || (data.className is string && data.className.size() <= 100)) &&
+        (!('classKey' in data) || (data.classKey is string && data.classKey.size() <= 50)) &&
+        (!('students' in data) || (data.students is list && data.students.size() <= 120)) &&
+        (!('totalStudents' in data) || (data.totalStudents is int && data.totalStudents >= 0 && data.totalStudents <= 120));
+    }
+
+    function isValidClassDoc(data) {
+      return isValidPayloadBase(data) &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 64)) &&
+        (!('name' in data) || (data.name is string && data.name.size() <= 100)) &&
+        (!('grade' in data) || (data.grade is string && data.grade.size() <= 50)) &&
+        (!('subjects' in data) || (data.subjects is list && data.subjects.size() <= 50));
+    }
+
+    function isValidQuestion(data) {
+      return isValidPayloadBase(data) &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
+        (!('code' in data) || (data.code is string && data.code.size() <= 128)) &&
+        (!('subject' in data) || (data.subject is string && data.subject.size() <= 100)) &&
+        (!('grade' in data) || (data.grade is string && data.grade.size() <= 50)) &&
+        (!('level' in data) || (data.level is string && data.level.size() <= 64)) &&
+        (!('type' in data) || (data.type is string && data.type.size() <= 64)) &&
+        (!('content' in data) || (data.content is string && data.content.size() <= 20000)) &&
+        (!('lessonName' in data) || (data.lessonName is string && data.lessonName.size() <= 500)) &&
+        (!('correctAnswer' in data) || (data.correctAnswer is string && data.correctAnswer.size() <= 20000)) &&
+        (!('explanation' in data) || (data.explanation is string && data.explanation.size() <= 20000)) &&
+        (!('options' in data) || (data.options is list && data.options.size() <= 30)) &&
+        (!('statements' in data) || (data.statements is list && data.statements.size() <= 30));
+    }
+
+    function isValidEducationalDoc(data) {
+      return isValidPayloadBase(data) &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
+        (!('title' in data) || (data.title is string && data.title.size() <= 500));
+    }
+
+    function isValidSubmissionDoc(data) {
+      return isValidPayloadBase(data) &&
+        (!('studentCode' in data) || (data.studentCode is string && data.studentCode.size() <= 64)) &&
+        (!('studentName' in data) || (data.studentName is string && data.studentName.size() <= 200));
+    }
+
+    function isValidYearEndResult(data) {
+      return isValidPayloadBase(data) &&
+        (!('status' in data) || (data.status is string && data.status in ['promoted', 'review_needed', 'retained']));
+    }
+
+    function isValidActivityDoc(data) {
+      return isValidPayloadBase(data) &&
+        (!('description' in data) || (data.description is string && data.description.size() > 0 && data.description.size() <= 2000));
+    }
+
+    match /_system_check_/{checkId} {
+      allow get: if isSignedIn() && isValidId(checkId);
+      allow list, write: if false;
     }
 
     match /users/{userId} {
-      allow read, write: if isSignedIn();
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
+        isVerifiedAdmin() ||
+        (request.auth.uid == userId && (!('role' in incoming()) || incoming().role != 'admin' || isBootstrappedAdminEmail()))
+      );
+      allow update: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
+        isVerifiedAdmin() ||
+        (request.auth.uid == userId && (!('role' in incoming()) || incoming().role == existing().role || isBootstrappedAdminEmail()))
+      );
+      allow delete: if isVerifiedAdmin() && isValidId(userId);
+    }
+
+    match /teachers/{teacherId} {
+      allow get: if isSignedIn() && isValidId(teacherId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(teacherId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(teacherId);
+    }
+
+    match /teacher_groups/{groupId} {
+      allow get: if isSignedIn() && isValidId(groupId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(groupId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(groupId);
+    }
+
+    match /departments/{departmentId} {
+      allow get: if isSignedIn() && isValidId(departmentId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(departmentId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(departmentId);
+    }
+
+    match /to_chuyen_mon/{departmentId} {
+      allow get: if isSignedIn() && isValidId(departmentId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(departmentId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(departmentId);
+    }
+
+    match /system_settings/{settingId} {
+      allow get: if isSignedIn() && isValidId(settingId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(settingId) && isValidPayloadBase(incoming());
+      allow delete: if isVerifiedAdmin() && isValidId(settingId);
+    }
+
+    match /settings/{settingId} {
+      allow get: if isSignedIn() && isValidId(settingId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(settingId) && isValidPayloadBase(incoming());
+      allow delete: if isVerifiedAdmin() && isValidId(settingId);
+    }
+
+    match /classes/{classId} {
+      allow get: if isSignedIn() && isValidId(classId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(classId) && isValidClassDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(classId);
+    }
+
+    match /class_rosters/{rosterId} {
+      allow get: if isSignedIn() && isValidId(rosterId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(rosterId) && isValidClassRoster(incoming());
+      allow delete: if isSignedIn() && isValidId(rosterId);
     }
 
     match /students/{studentId} {
-      allow read, write: if isSignedIn();
+      allow get: if isSignedIn() && isValidId(studentId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(studentId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(studentId);
     }
 
-    match /lessons/{lessonId} {
-      allow read, write: if isSignedIn();
+    match /student_enrollments/{enrollmentId} {
+      allow get: if isSignedIn() && isValidId(enrollmentId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(enrollmentId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(enrollmentId);
+    }
+
+    match /student_year_end_results/{resultId} {
+      allow get: if isSignedIn() && isValidId(resultId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(resultId) && isValidYearEndResult(incoming());
+      allow delete: if isSignedIn() && isValidId(resultId);
     }
 
     match /questions/{questionId} {
-      allow read, write: if isSignedIn();
+      allow get: if isSignedIn() && isValidId(questionId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(questionId) && isValidQuestion(incoming());
+      allow delete: if isSignedIn() && isValidId(questionId);
+    }
+
+    match /lessons/{lessonId} {
+      allow get: if isSignedIn() && isValidId(lessonId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(lessonId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(lessonId);
+    }
+
+    match /lessonPlans/{lessonId} {
+      allow get: if isSignedIn() && isValidId(lessonId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(lessonId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(lessonId);
+    }
+
+    match /elearning_lessons/{lessonId} {
+      allow get: if isSignedIn() && isValidId(lessonId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(lessonId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(lessonId);
+    }
+
+    match /assigned_elearning/{assignId} {
+      allow get: if isSignedIn() && isValidId(assignId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(assignId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(assignId);
+    }
+
+    match /elearning_student_progress/{progressId} {
+      allow get: if isSignedIn() && isValidId(progressId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(progressId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(progressId);
     }
 
     match /exams/{examId} {
-      allow read, write: if isSignedIn();
+      allow get: if isSignedIn() && isValidId(examId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(examId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(examId);
+
+      match /submissions/{submissionId} {
+        allow get: if isSignedIn() && isValidId(examId) && isValidId(submissionId);
+        allow list: if isSignedIn() && isValidId(examId);
+        allow create, update: if isSignedIn() && isValidId(examId) && isValidId(submissionId) && isValidSubmissionDoc(incoming());
+        allow delete: if isSignedIn() && isValidId(examId) && isValidId(submissionId);
+      }
+    }
+
+    match /exam_drafts/{draftId} {
+      allow get: if isSignedIn() && isValidId(draftId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(draftId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(draftId);
+    }
+
+    match /exam_progress/{progressId} {
+      allow get: if isSignedIn() && isValidId(progressId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(progressId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(progressId);
     }
 
     match /assignments/{assignmentId} {
-      allow read, write: if isSignedIn();
+      allow get: if isSignedIn() && isValidId(assignmentId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(assignmentId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(assignmentId);
+
+      match /submissions/{submissionId} {
+        allow get: if isSignedIn() && isValidId(assignmentId) && isValidId(submissionId);
+        allow list: if isSignedIn() && isValidId(assignmentId);
+        allow create, update: if isSignedIn() && isValidId(assignmentId) && isValidId(submissionId) && isValidSubmissionDoc(incoming());
+        allow delete: if isSignedIn() && isValidId(assignmentId) && isValidId(submissionId);
+      }
+    }
+
+    match /homeworkAssignments/{assignmentId} {
+      allow get: if isSignedIn() && isValidId(assignmentId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(assignmentId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(assignmentId);
+    }
+
+    match /submissions/{submissionId} {
+      allow get: if isSignedIn() && isValidId(submissionId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(submissionId) && isValidSubmissionDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(submissionId);
+    }
+
+    match /deleted_submissions_backup/{backupId} {
+      allow get: if isSignedIn() && isValidId(backupId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(backupId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(backupId);
+    }
+
+    match /student_results/{studentCode} {
+      allow get: if isSignedIn() && isValidId(studentCode);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(studentCode) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(studentCode);
+
+      match /exams/{examId} {
+        allow get: if isSignedIn() && isValidId(studentCode) && isValidId(examId);
+        allow list: if isSignedIn() && isValidId(studentCode);
+        allow create, update: if isSignedIn() && isValidId(studentCode) && isValidId(examId) && isValidSubmissionDoc(incoming());
+        allow delete: if isSignedIn() && isValidId(studentCode) && isValidId(examId);
+      }
+
+      match /assignments/{assignmentId} {
+        allow get: if isSignedIn() && isValidId(studentCode) && isValidId(assignmentId);
+        allow list: if isSignedIn() && isValidId(studentCode);
+        allow create, update: if isSignedIn() && isValidId(studentCode) && isValidId(assignmentId) && isValidSubmissionDoc(incoming());
+        allow delete: if isSignedIn() && isValidId(studentCode) && isValidId(assignmentId);
+      }
+    }
+
+    match /games/{gameId} {
+      allow get: if isSignedIn() && isValidId(gameId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(gameId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(gameId);
+    }
+
+    match /quizzi_games/{gameId} {
+      allow get: if isSignedIn() && isValidId(gameId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(gameId) && isValidEducationalDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(gameId);
+    }
+
+    match /quiz_live_sessions/{sessionId} {
+      allow get: if isSignedIn() && isValidId(sessionId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(sessionId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(sessionId);
+    }
+
+    match /score_records/{recordId} {
+      allow get: if isSignedIn() && isValidId(recordId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(recordId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(recordId);
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && isValidId(notificationId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(notificationId) && isValidPayloadBase(incoming());
+      allow delete: if isSignedIn() && isValidId(notificationId);
     }
 
     match /activities/{activityId} {
-      allow read, write: if isSignedIn();
+      allow get: if isSignedIn() && isValidId(activityId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(activityId) && isValidActivityDoc(incoming());
+      allow delete: if isSignedIn() && isValidId(activityId);
     }
 
     match /{document=**} {

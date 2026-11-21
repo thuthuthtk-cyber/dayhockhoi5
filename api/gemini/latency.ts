@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 
-const RECOMMENDED_MODELS = ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'];
+const RECOMMENDED_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
 const DEFAULT_MODEL = 'gemini-4-hydrogen';
 
 export default async function handler(req: any, res: any) {

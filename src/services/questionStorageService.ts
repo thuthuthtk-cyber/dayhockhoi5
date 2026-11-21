@@ -21,13 +21,24 @@ export function isQuestionMatchingGrade(questionGrade?: string, filterGrade?: st
   return questionGrade.toLowerCase().includes(filterGrade.toLowerCase()) || filterGrade.toLowerCase().includes(questionGrade.toLowerCase());
 }
 
-import { db, auth, isFirestoreQuotaExceeded, markFirestoreQuotaExceeded } from './firebase';
+import {
+  db,
+  auth,
+  ensureFirebaseAuthSession,
+  getLastAuthErrorCode,
+  isFirestoreQuotaExceeded,
+  markFirestoreQuotaExceeded
+} from './firebase';
+import { signInAnonymously } from 'firebase/auth';
 import {
   collection,
   doc,
   getDocs,
   onSnapshot,
-  getDocFromServer
+  getDocFromServer,
+  query,
+  where,
+  QueryConstraint
 } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch } from './firestoreWriteTracker';
 import { INITIAL_QUESTIONS } from './mockData';
@@ -84,6 +95,72 @@ export function handleFirestoreError(error: unknown, operationType: FirestoreOpT
   throw new Error(JSON.stringify(errInfo));
 }
 
+/**
+ * Đảm bảo có phiên Firebase Auth hợp lệ trước khi thao tác ghi/đọc Firestore.
+ * Nếu auth.currentUser đang là null thì tự động gọi signInAnonymously(auth) trong try/catch.
+ */
+export async function ensureQuestionAuthSession(): Promise<void> {
+  if (!auth || auth.currentUser) return;
+  try {
+    const user = await ensureFirebaseAuthSession();
+    if (!user && !auth.currentUser) {
+      await signInAnonymously(auth);
+    }
+  } catch (err: any) {
+    console.warn('[QuestionStorage] Không thể tự động đăng nhập ẩn danh Firebase Auth:', err?.code || err?.message || err);
+  }
+}
+
+/**
+ * Loại bỏ đệ quy toàn bộ trường có giá trị undefined / NaN / Infinity trước khi ghi lên Firestore.
+ */
+export function stripUndefinedForFirestore<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== undefined)
+      .map((item) => stripUndefinedForFirestore(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const result: Record<string, any> = {};
+    Object.entries(value as Record<string, any>).forEach(([k, v]) => {
+      if (v === undefined) return;
+      if (typeof v === 'number' && !Number.isFinite(v)) {
+        result[k] = 0;
+        return;
+      }
+      result[k] = stripUndefinedForFirestore(v);
+    });
+    return result as T;
+  }
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return 0 as unknown as T;
+  }
+  return value;
+}
+
+function formatQuestionSaveErrorMessage(error: any): string {
+  const code = error?.code || '';
+  const raw = error?.message || String(error || '');
+  const authErr = getLastAuthErrorCode();
+
+  if (code === 'permission-denied' || raw.includes('permission-denied') || raw.includes('Missing or insufficient permissions')) {
+    if (!auth?.currentUser && (authErr === 'auth/operation-not-allowed' || authErr === 'auth/admin-restricted-operation')) {
+      return 'Firebase chưa bật đăng nhập ẩn danh (Anonymous Auth) hoặc bạn chưa đăng nhập Google. Vui lòng bật Anonymous trong Firebase Console hoặc đăng nhập Google rồi thử lưu lại.';
+    }
+    if (!auth?.currentUser) {
+      return 'Phiên xác thực Firebase Auth chưa sẵn sàng (permission-denied). Vui lòng đăng nhập lại bằng Google hoặc bật Anonymous Auth trong Firebase Console.';
+    }
+    return 'Firestore từ chối quyền ghi câu hỏi (permission-denied). Vui lòng kiểm tra Firestore Security Rules hoặc phiên đăng nhập.';
+  }
+  if (code === 'resource-exhausted' || raw.includes('resource-exhausted') || raw.includes('Quota exceeded')) {
+    return 'Đã vượt quá hạn mức ghi dữ liệu Firestore trong ngày (resource-exhausted). Dữ liệu câu hỏi đã được giữ an toàn trong bộ nhớ đệm cục bộ.';
+  }
+  if (code === 'unavailable' || raw.includes('unavailable')) {
+    return 'Kết nối máy chủ Firestore tạm thời bị gián đoạn (unavailable). Vui lòng kiểm tra mạng và thử lại.';
+  }
+  return raw || 'Lỗi không xác định khi lưu câu hỏi lên Firestore.';
+}
+
 export function fixMisTypedTrueFalseQuestions(questions: QuestionItem[]): { fixedQuestions: QuestionItem[]; fixedCount: number; fixedIds: string[] } {
   let fixedCount = 0;
   const fixedIds: string[] = [];
@@ -113,11 +190,13 @@ export function fixMisTypedTrueFalseQuestions(questions: QuestionItem[]): { fixe
  * Clean & sanitize question data before saving to Firestore to prevent undefined or missing fields
  */
 export function sanitizeQuestionForFirestore(q: QuestionItem): QuestionItem {
-  const safeId = q.id || `q-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const rawId = q.id || `q-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const safeId = String(rawId).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 128) || `q-${Date.now()}`;
   let qType = q.type || 'multiple_choice';
   const hasMatchingPairs = Array.isArray(q.matchingPairs) && q.matchingPairs.length > 0;
-  const contentLower = (q.content || '').toLowerCase();
-  const hasMatchingKeywords = contentLower.includes('cột a') && contentLower.includes('cột b') || contentLower.includes('nối') || contentLower.includes('ghép cặp');
+  const contentText = (q.content || q.questionText || '').trim() || 'Nội dung câu hỏi';
+  const contentLower = contentText.toLowerCase();
+  const hasMatchingKeywords = (contentLower.includes('cột a') && contentLower.includes('cột b')) || contentLower.includes('nối') || contentLower.includes('ghép cặp');
   const isMatchingType = qType === 'matching' || qType === 'nối cặp' || qType === 'kéo thả' || hasMatchingPairs || hasMatchingKeywords;
   const hasStatements = Array.isArray(q.statements) && q.statements.length > 0;
 
@@ -129,32 +208,38 @@ export function sanitizeQuestionForFirestore(q: QuestionItem): QuestionItem {
 
   const isOrdering = qType === 'ordering' || qType === 'sắp xếp' || qType === 'sắp xếp thứ tự' || qType === 'sap_xep';
   let defaultCorrectAnswer = 'A';
-  if (q.type === 'essay') {
+  if (qType === 'essay') {
     defaultCorrectAnswer = 'Gợi ý chấm tự luận';
   } else if (isOrdering && Array.isArray(q.options) && q.options.length > 0) {
-    defaultCorrectAnswer = q.options.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
+    defaultCorrectAnswer = q.options.map((opt, i) => `${i + 1}. ${opt ?? ''}`).join('\n');
   }
 
-  const cleanQ: QuestionItem = {
-    id: String(safeId),
-    code: q.code || `CH-${(q.subject || 'TOAN').toUpperCase().slice(0, 3)}-${Date.now().toString().slice(-4)}`,
-    subject: q.subject || 'Toán',
-    grade: q.grade || 'Khối 5',
-    level: q.level || 'nhan_biet',
-    type: qType,
-    content: q.content || 'Nội dung câu hỏi',
-    lessonName: q.lessonName || 'Bài học',
-    correctAnswer: q.correctAnswer || defaultCorrectAnswer,
-    explanation: q.explanation || 'Hướng dẫn sư phạm cho câu hỏi.',
+  const cleanQ: QuestionItem & { updatedAt?: string } = {
+    id: safeId,
+    code: String(q.code || `CH-${(q.subject || 'TOAN').toUpperCase().slice(0, 3)}-${Date.now().toString().slice(-4)}`).slice(0, 128),
+    subject: (q.subject || 'Toán') as QuestionItem['subject'],
+    grade: (q.grade || 'Khối 5') as QuestionItem['grade'],
+    level: (q.level || 'nhan_biet') as QuestionItem['level'],
+    type: qType as QuestionItem['type'],
+    content: contentText,
+    lessonName: String(q.lessonName || 'Bài học'),
+    correctAnswer: String(q.correctAnswer || defaultCorrectAnswer),
+    explanation: String(q.explanation || 'Hướng dẫn sư phạm cho câu hỏi.'),
+    updatedAt: new Date().toISOString(),
   };
 
+  if (q.questionText) cleanQ.questionText = String(q.questionText);
+  if (q.topic) cleanQ.topic = String(q.topic);
+  if (q.imageUrl) cleanQ.imageUrl = String(q.imageUrl);
+  if (q.imagePrompt) cleanQ.imagePrompt = String(q.imagePrompt);
+
   if (Array.isArray(q.options) && q.options.length > 0) {
-    cleanQ.options = q.options.filter(Boolean);
+    cleanQ.options = q.options.filter((opt) => opt !== undefined && opt !== null && String(opt).trim() !== '');
   }
 
   if (isOrdering) {
     const trueSequence = extractTrueOrderingFromQuestion(q);
-    cleanQ.correctOrder = trueSequence.length > 0 ? trueSequence : (cleanQ.options || []);
+    cleanQ.correctOrder = (trueSequence.length > 0 ? trueSequence : (cleanQ.options || [])).map(item => String(item ?? ''));
     cleanQ.order = (cleanQ.options || []).map((_, i) => i);
     cleanQ.indices = (cleanQ.options || []).map((_, i) => i);
     cleanQ.correctAnswer = cleanQ.correctOrder.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
@@ -162,35 +247,44 @@ export function sanitizeQuestionForFirestore(q: QuestionItem): QuestionItem {
 
   if (Array.isArray(q.statements) && q.statements.length > 0) {
     cleanQ.statements = q.statements.map(st => ({
-      statement: st.statement || '',
-      isCorrect: Boolean(st.isCorrect),
-      explanation: st.explanation || ''
+      statement: st?.statement || '',
+      isCorrect: Boolean(st?.isCorrect),
+      explanation: st?.explanation || ''
     }));
   }
 
   if (Array.isArray(q.classificationGroups) && q.classificationGroups.length > 0) {
-    cleanQ.classificationGroups = q.classificationGroups.filter(Boolean);
+    cleanQ.classificationGroups = q.classificationGroups.filter((g) => g !== undefined && g !== null && String(g).trim() !== '');
   }
 
   if (Array.isArray(q.classificationItems) && q.classificationItems.length > 0) {
     cleanQ.classificationItems = q.classificationItems.map(item => ({
-      name: item.name || '',
-      group: item.group || ''
+      name: item?.name || '',
+      group: item?.group || ''
     }));
   }
 
   if (Array.isArray(q.matchingPairs) && q.matchingPairs.length > 0) {
     cleanQ.matchingPairs = q.matchingPairs.map(p => ({
-      left: p.left || '',
-      right: p.right || '',
-      match: p.match || ''
+      left: p?.left || '',
+      right: p?.right || '',
+      match: p?.match || ''
     }));
   }
 
-  if (q.authorName) cleanQ.authorName = q.authorName;
+  if (q.authorName) cleanQ.authorName = String(q.authorName);
   if (q.authorType) cleanQ.authorType = q.authorType;
+  if (q.teacherId) cleanQ.teacherId = String(q.teacherId);
+  if (q.teacherName) cleanQ.teacherName = String(q.teacherName);
+  if (q.teacherEmail) cleanQ.teacherEmail = String(q.teacherEmail);
+  if (q.createdBy) cleanQ.createdBy = String(q.createdBy);
+  if (q.createdAt !== undefined && q.createdAt !== null) {
+    cleanQ.createdAt = typeof q.createdAt === 'number' || typeof q.createdAt === 'string'
+      ? q.createdAt
+      : new Date().toISOString();
+  }
 
-  return cleanQ;
+  return stripUndefinedForFirestore(cleanQ);
 }
 
 /**
@@ -276,8 +370,10 @@ export async function saveQuestionToFirestore(question: QuestionItem): Promise<v
       return;
     }
 
+    await ensureQuestionAuthSession();
+
     const docRef = doc(db, QUESTIONS_COLLECTION, sanitized.id);
-    await trackedSetDoc(docRef, sanitized);
+    await trackedSetDoc(docRef, stripUndefinedForFirestore(sanitized));
 
     // Update local cache
     const current = getLocalCachedQuestions();
@@ -331,6 +427,9 @@ export async function saveQuestionsBatchToFirestore(
   });
 
   const batchWriteOperation = async (): Promise<{ success: boolean; count: number }> => {
+    // 0. Ensure valid Firebase Auth session before writing
+    await ensureQuestionAuthSession();
+
     // 1. Chunk writeBatch into maximum 500 operations per batch
     const CHUNK_SIZE = 500;
     for (let i = 0; i < sanitizedList.length; i += CHUNK_SIZE) {
@@ -338,7 +437,7 @@ export async function saveQuestionsBatchToFirestore(
       const batch = trackedWriteBatch(db);
       chunk.forEach(q => {
         const docRef = doc(db, QUESTIONS_COLLECTION, q.id);
-        batch.set(docRef, q);
+        batch.set(docRef, stripUndefinedForFirestore(q));
       });
       await batch.commit();
     }
@@ -386,11 +485,16 @@ export async function saveQuestionsBatchToFirestore(
       errMsg.includes('Quota exceeded') ||
       errMsg.includes('unavailable')
     ) {
-        localStorage.setItem('eduplay_k5_firestore_quota_exceeded', 'true');
-
+      markFirestoreQuotaExceeded();
     }
 
-    throw error;
+    const friendlyMessage = formatQuestionSaveErrorMessage(error);
+    try {
+      handleFirestoreError(error, FirestoreOpType.WRITE, `${QUESTIONS_COLLECTION}/[batch_${sanitizedList.length}]`);
+    } catch {
+      // Structured diagnostics logged above via console.error; rethrow friendly localized error for UI
+    }
+    throw new Error(friendlyMessage);
   }
 }
 
@@ -479,6 +583,7 @@ export async function deleteQuestionFromFirestore(id: string): Promise<void> {
   });
 
   const deleteOp = async () => {
+    await ensureQuestionAuthSession();
     const docRef = doc(db, QUESTIONS_COLLECTION, id);
     await trackedDeleteDoc(docRef);
     await waitForWriteConfirmation(docRef, 12000, true);
@@ -498,9 +603,7 @@ export async function deleteQuestionFromFirestore(id: string): Promise<void> {
       errMsg.includes('Quota exceeded') ||
       errMsg.includes('unavailable')
     ) {
-      try {
-        localStorage.setItem('eduplay_k5_firestore_quota_exceeded', 'true');
-      } catch {}
+      markFirestoreQuotaExceeded();
       const current = getLocalCachedQuestions();
       saveLocalCachedQuestions(current.filter(q => q.id !== id));
       return;
@@ -539,6 +642,7 @@ export async function deleteQuestionsBatchFromFirestore(
   });
 
   const deleteOperation = async (): Promise<{ success: boolean; count: number }> => {
+    await ensureQuestionAuthSession();
     const chunkSize = 100;
     let deletedCount = 0;
 
@@ -577,9 +681,7 @@ export async function deleteQuestionsBatchFromFirestore(
       errMsg.includes('Quota exceeded') ||
       errMsg.includes('unavailable')
     ) {
-      try {
-        localStorage.setItem('eduplay_k5_firestore_quota_exceeded', 'true');
-      } catch {}
+      markFirestoreQuotaExceeded();
       const current = getLocalCachedQuestions();
       saveLocalCachedQuestions(current.filter(q => !idSet.has(q.id)));
       if (onProgress) onProgress(ids.length, ids.length);
@@ -593,11 +695,50 @@ export async function deleteQuestionsBatchFromFirestore(
 }
 
 /**
+ * Fetch questions from Firestore filtered via where() when grade/subject/lessonName provided
+ */
+export async function fetchQuestionsFilteredFromFirestore(filters?: {
+  grade?: string;
+  subject?: string;
+  lessonName?: string;
+}): Promise<QuestionItem[]> {
+  try {
+    if (!db) return getLocalCachedQuestions();
+    await ensureQuestionAuthSession();
+
+    const constraints: QueryConstraint[] = [];
+    if (filters?.grade && filters.grade !== 'all' && filters.grade !== 'Tất cả các khối') {
+      constraints.push(where('grade', '==', filters.grade));
+    }
+    if (filters?.subject && filters.subject !== 'all' && filters.subject !== 'Tất cả các môn') {
+      constraints.push(where('subject', '==', filters.subject));
+    }
+    if (filters?.lessonName && filters.lessonName !== 'all') {
+      constraints.push(where('lessonName', '==', filters.lessonName));
+    }
+
+    const qRef = constraints.length > 0
+      ? query(collection(db, QUESTIONS_COLLECTION), ...constraints)
+      : collection(db, QUESTIONS_COLLECTION);
+
+    const snap = await getDocs(qRef);
+    return snap.docs.map(docSnap => ({
+      ...(docSnap.data() as QuestionItem),
+      id: docSnap.id
+    }));
+  } catch (error) {
+    console.warn('Error fetching filtered questions from Firestore:', error);
+    return getLocalCachedQuestions();
+  }
+}
+
+/**
  * Fetch all questions from Firestore directly (one-time fetch)
  */
 export async function fetchQuestionsFromFirestore(): Promise<QuestionItem[]> {
   try {
     if (!db) return getLocalCachedQuestions();
+    await ensureQuestionAuthSession();
 
     const snap = await getDocs(collection(db, QUESTIONS_COLLECTION));
     if (!snap.empty) {
@@ -701,8 +842,11 @@ export async function migrateFirestoreOrderingData(): Promise<void> {
       }
     });
 
-    // 2. Đọc trực tiếp từ Firestore để ghi đè
-    const snap = await getDocs(collection(db, QUESTIONS_COLLECTION));
+    // 2. Đọc trực tiếp từ Firestore để ghi đè (chỉ chạy nếu có phiên Auth hoặc không bị quota)
+    if (!db || isFirestoreQuotaExceeded()) return;
+    await ensureQuestionAuthSession();
+    const qOrdering = query(collection(db, QUESTIONS_COLLECTION), where('type', 'in', ['ordering', 'sắp xếp', 'sắp xếp thứ tự', 'sap_xep']));
+    const snap = await getDocs(qOrdering);
     if (!snap.empty) {
       const batch = trackedWriteBatch(db);
       let batchCount = 0;

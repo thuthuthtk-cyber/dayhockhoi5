@@ -597,7 +597,6 @@ export const Header: React.FC<HeaderProps> = ({
                 >
                   <option value="">Tự động ưu tiên (Mặc định: gemini-4-hydrogen / Đã nhớ)</option>
                   <option value="gemini-4-hydrogen">gemini-4-hydrogen (Mô hình chuẩn - Ổn định & Nhanh)</option>
-                  <option value="gemini-2.5-flash">gemini-2.5-flash (Flash thế hệ mới)</option>
                   <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Mô hình nhẹ, tốc độ cao)</option>
                 </select>
                 <p className="text-[11px] text-gray-400 mt-1">

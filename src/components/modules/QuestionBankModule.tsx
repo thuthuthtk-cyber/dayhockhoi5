@@ -38,7 +38,7 @@ import {
 import { QuestionItem, CognitiveLevel, UserRole } from '../../types';
 import { PRIMARY_SCHOOL_SUBJECTS } from '../../services/mockData';
 import { QUESTION_TYPES, getQuestionTypeLabel, matchesQuestionType, normalizeQuestionType, getCorrectOrderingSequence } from '../../lib/constants';
-import { sanitizeQuestionForFirestore, fetchQuestionsFromFirestore, subscribeToQuestionsFromFirestore, getLocalCachedQuestions, deleteQuestionFromFirestore, deleteQuestionsBatchFromFirestore, saveQuestionsBatchToFirestore, downloadQuestionsAsJSON, downloadQuestionsAsCSV } from '../../services/questionStorageService';
+import { sanitizeQuestionForFirestore, stripUndefinedForFirestore, ensureQuestionAuthSession, fetchQuestionsFromFirestore, subscribeToQuestionsFromFirestore, getLocalCachedQuestions, deleteQuestionFromFirestore, deleteQuestionsBatchFromFirestore, saveQuestionsBatchToFirestore, downloadQuestionsAsJSON, downloadQuestionsAsCSV } from '../../services/questionStorageService';
 import { downloadQuestionBankTemplate, exportQuestionBankToExcel } from '../../services/excelService';
 import { generateExamQuestionsAI, cleanRawExamText } from '../../services/geminiService';
 import { TECHNOLOGY_GRADE3_FINAL_EXAM_BLUEPRINT } from '../../config/examBlueprints';
@@ -706,9 +706,11 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
     setIsSaving(true);
     setSaveError(null);
     try {
+      await ensureQuestionAuthSession();
+
       const sanitizedQuestions: QuestionItem[] = previewQuestions.map((q, idx) => {
         const fallbackCode = `CH-${(quickSubject || 'TOAN').toUpperCase().slice(0, 3)}-${Date.now().toString().slice(-4)}-${idx + 1}`;
-        const raw = {
+        const raw = stripUndefinedForFirestore({
           ...q,
           id: q.id || `q-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 5)}`,
           code: q.code || fallbackCode,
@@ -717,10 +719,10 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
           level: q.level || 'nhan_biet',
           type: normalizeQuestionType(q.type),
           lessonName: quickLessonName || q.lessonName || 'Bài học',
-          content: q.content,
+          content: q.content || q.questionText || 'Nội dung câu hỏi',
           explanation: q.explanation || 'Giải thích sư phạm cho câu hỏi.',
           createdAt: q.createdAt || Date.now()
-        };
+        });
         return sanitizeQuestionForFirestore(raw);
       });
 
@@ -741,7 +743,13 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
       showToast(`Đã lưu thành công ${sanitizedQuestions.length} câu hỏi vào hệ thống!`, "success");
     } catch (error: any) {
       console.error('Error saving questions to database:', error);
-      const errorMessage = error?.message || (typeof error === 'string' ? error : 'Firebase từ chối ghi hoặc gián đoạn kết nối CSDL.');
+      let errorMessage = error?.message || (typeof error === 'string' ? error : 'Firebase từ chối ghi hoặc gián đoạn kết nối CSDL.');
+      try {
+        const parsed = JSON.parse(errorMessage);
+        if (parsed?.error) {
+          errorMessage = String(parsed.error);
+        }
+      } catch {}
       setSaveError(errorMessage);
       showToast(`Lỗi khi lưu vào CSDL: ${errorMessage}`, "error");
     } finally {

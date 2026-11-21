@@ -1,15 +1,22 @@
 import { GoogleGenAI } from '@google/genai';
 
-const RECOMMENDED_MODELS = ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'];
+const RECOMMENDED_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
 const DEFAULT_MODEL = 'gemini-4-hydrogen';
+const ALLOWED_TEXT_MODELS = new Set([
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+  'gemini-4-neon',
+  'gemini-4-carbon',
+  'gemini-4-argon',
+]);
 
 function sanitizeModelName(model?: string): string {
   if (!model || typeof model !== 'string') return DEFAULT_MODEL;
-  const m = model.trim().toLowerCase();
-  if (m.includes('1.5') || m.includes('2.0') || m.includes('3.8-flash') || m.includes('flash-latest') || m.includes('pro-latest')) {
-    return DEFAULT_MODEL;
+  const m = model.trim().toLowerCase().replace(/^models\//, '');
+  if (ALLOWED_TEXT_MODELS.has(m)) {
+    return m;
   }
-  return model.trim();
+  return DEFAULT_MODEL;
 }
 
 export default async function handler(req: any, res: any) {

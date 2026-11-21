@@ -7,6 +7,6 @@ export default function handler(req: any, res: any) {
   }
 
   return res.status(200).json({
-    models: ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-3.1-flash-lite']
+    models: ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
   });
 }

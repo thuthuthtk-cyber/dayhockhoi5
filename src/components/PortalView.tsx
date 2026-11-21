@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Volume2, HelpCircle, ArrowLeft, KeyRound, LogIn, Delete, RotateCcw, Sparkles, ArrowDownAZ, ArrowUpZA, AlertCircle, RefreshCw } from 'lucide-react';
 import { UserRole, StudentRecord } from '../types';
-import { auth } from '../services/firebase';
+import { auth, ensureFirebaseAuthSession } from '../services/firebase';
 import { GoogleAuthProvider, signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   getStudentsFromLocalStorage,
@@ -345,7 +345,8 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
 
   // Load all class rosters on mount to populate class & grade counts immediately
   useEffect(() => {
-    fetchAllStudentsFromFirestore()
+    ensureFirebaseAuthSession()
+      .then(() => fetchAllStudentsFromFirestore())
       .then((rosters) => {
         if (rosters && Object.keys(rosters).length > 0) {
           setAllClassRosters(rosters);
@@ -513,6 +514,7 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
   // Final Action: Enter Student Learning Room
   const handleEnterStudentRoom = () => {
     if (!selectedStudent) return;
+    ensureFirebaseAuthSession().catch(() => {});
     const studentEmail = selectedStudent.email || `hs.${selectedStudent.code}@quanghungpk1.edu.vn`;
     saveStudentSession(selectedStudent);
     onSelectPortal('student', selectedGrade, selectedClass, {

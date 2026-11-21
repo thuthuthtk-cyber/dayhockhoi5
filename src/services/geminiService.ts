@@ -15,7 +15,6 @@ export const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 export const GEMINI_MODEL = DEFAULT_MODEL;
 export const FALLBACK_GEMINI_MODELS = [
   'gemini-4-hydrogen',
-  'gemini-2.5-flash',
   'gemini-3.1-flash-lite'
 ];
 
@@ -59,8 +58,11 @@ export function isTextOnlyGeminiModel(modelName: string): boolean {
     name.startsWith('gemini-1.0') ||
     name.startsWith('gemini-1.5') ||
     name.startsWith('gemini-2.0') ||
+    name.startsWith('gemini-2.5') ||
     name === 'gemini-3.8-flash' ||
+    name === 'gemini-pro' ||
     name === 'gemini-flash-latest' ||
+    name === 'gemini-pro-latest' ||
     name.startsWith('text-bison') ||
     name.startsWith('chat-bison')
   ) {
@@ -188,7 +190,7 @@ export function setStoredApiKey(key: string): void {
  * Discover models supported by the server backend.
  */
 export async function getAvailableGeminiModels(_apiKey?: string): Promise<string[]> {
-  const defaultFallback = ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'];
+  const defaultFallback = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
   try {
     const response = await fetch('/api/gemini/models');
     const contentType = response.headers.get('content-type') || '';
@@ -198,7 +200,8 @@ export async function getAvailableGeminiModels(_apiKey?: string): Promise<string
         try {
           const data = JSON.parse(text);
           if (Array.isArray(data.models) && data.models.length > 0) {
-            return data.models;
+            const validModels = data.models.filter((m: unknown) => typeof m === 'string' && isTextOnlyGeminiModel(m));
+            if (validModels.length > 0) return validModels;
           }
         } catch {}
       }

@@ -4,6 +4,8 @@ export {
   db,
   auth,
   firebaseConfig,
+  ensureFirebaseAuthSession,
+  getLastAuthErrorCode,
   isFirestoreQuotaExceeded,
   markFirestoreQuotaExceeded,
   resetFirestoreQuotaAndEnableNetwork,

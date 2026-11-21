@@ -2,60 +2,211 @@
   "entities": {
     "User": {
       "title": "User",
-      "description": "User account and profile in day-hoc-tin-hoc-cong-nghe",
+      "description": "User account and profile",
       "type": "object",
       "properties": {
-        "uid": { "type": "string" },
-        "displayName": { "type": "string" },
-        "email": { "type": "string" },
-        "role": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "uid": { "type": "string", "maxLength": 128 },
+        "id": { "type": "string", "maxLength": 128 },
+        "displayName": { "type": "string", "maxLength": 200 },
+        "name": { "type": "string", "maxLength": 200 },
+        "email": { "type": "string", "maxLength": 200 },
+        "role": { "type": "string", "enum": ["admin", "teacher", "student"] },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "Teacher": {
+      "title": "Teacher",
+      "description": "Teacher directory record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
+        "email": { "type": "string", "maxLength": 200 },
+        "role": { "type": "string", "maxLength": 100 },
+        "toChuyenMon": { "type": "string", "maxLength": 150 },
+        "subject": { "type": "string", "maxLength": 150 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "TeacherGroup": {
+      "title": "TeacherGroup",
+      "description": "Teacher collaboration group",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "Department": {
+      "title": "Department",
+      "description": "School subject department / To chuyen mon",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "slug": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
+        "teachers": { "type": "array" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "SystemSetting": {
+      "title": "SystemSetting",
+      "description": "Global system configuration and registries",
+      "type": "object",
+      "properties": {
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "SchoolClass": {
+      "title": "SchoolClass",
+      "description": "Class metadata and configured subjects",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 100 },
+        "grade": { "type": "string", "maxLength": 50 },
+        "room": { "type": "string", "maxLength": 100 },
+        "homeroomTeacher": { "type": "string", "maxLength": 150 },
+        "subjects": { "type": "array" }
+      }
+    },
+    "ClassRoster": {
+      "title": "ClassRoster",
+      "description": "Class student roster aggregate document",
+      "type": "object",
+      "properties": {
+        "className": { "type": "string", "maxLength": 100 },
+        "classKey": { "type": "string", "maxLength": 50 },
+        "totalStudents": { "type": "integer" },
+        "male": { "type": "integer" },
+        "female": { "type": "integer" },
+        "students": { "type": "array" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       }
     },
     "Student": {
       "title": "Student",
-      "description": "Student record",
+      "description": "Individual student record",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "id": { "type": "string", "maxLength": 128 },
+        "code": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 200 },
+        "className": { "type": "string", "maxLength": 100 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       }
     },
-    "Lesson": {
-      "title": "Lesson",
-      "description": "Lesson plan record",
+    "StudentEnrollment": {
+      "title": "StudentEnrollment",
+      "description": "Academic year student enrollment record",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "sddcn": { "type": "string", "maxLength": 64 },
+        "academicYear": { "type": "string", "maxLength": 32 },
+        "classId": { "type": "string", "maxLength": 32 },
+        "className": { "type": "string", "maxLength": 100 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "StudentYearEndResult": {
+      "title": "StudentYearEndResult",
+      "description": "Year-end promotion evaluation record",
+      "type": "object",
+      "properties": {
+        "sddcn": { "type": "string", "maxLength": 64 },
+        "academicYear": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["promoted", "review_needed", "retained"] },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       }
     },
     "Question": {
       "title": "Question",
-      "description": "Question bank record",
+      "description": "Question bank item",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_.\\-]+$" },
+        "code": { "type": "string", "maxLength": 128 },
+        "subject": { "type": "string", "maxLength": 100 },
+        "grade": { "type": "string", "maxLength": 50 },
+        "level": { "type": "string", "maxLength": 64 },
+        "type": { "type": "string", "maxLength": 64 },
+        "content": { "type": "string", "maxLength": 20000 },
+        "lessonName": { "type": "string", "maxLength": 300 },
+        "correctAnswer": { "type": "string", "maxLength": 10000 },
+        "explanation": { "type": "string", "maxLength": 10000 },
+        "options": { "type": "array" },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "Lesson": {
+      "title": "Lesson",
+      "description": "5E / E-learning lesson plan record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "subject": { "type": "string", "maxLength": 100 },
+        "grade": { "type": "string", "maxLength": 50 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "AssignedElearning": {
+      "title": "AssignedElearning",
+      "description": "Assigned e-learning lesson to class",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "lessonId": { "type": "string", "maxLength": 128 },
+        "className": { "type": "string", "maxLength": 100 }
+      }
+    },
+    "ElearningStudentProgress": {
+      "title": "ElearningStudentProgress",
+      "description": "Student progress inside 5E lesson flow",
+      "type": "object",
+      "properties": {
+        "studentId": { "type": "string", "maxLength": 128 },
+        "lessonId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       }
     },
     "Exam": {
       "title": "Exam",
-      "description": "Exam matrix record",
+      "description": "Exam matrix and paper record",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "subject": { "type": "string", "maxLength": 100 },
+        "grade": { "type": "string", "maxLength": 50 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "ExamDraft": {
+      "title": "ExamDraft",
+      "description": "In-progress student exam draft",
+      "type": "object",
+      "properties": {
+        "studentCode": { "type": "string", "maxLength": 64 },
+        "examId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "ExamProgress": {
+      "title": "ExamProgress",
+      "description": "Live exam progress state",
+      "type": "object",
+      "properties": {
+        "studentCode": { "type": "string", "maxLength": 64 },
+        "examId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       }
     },
     "Assignment": {
@@ -63,10 +214,74 @@
       "description": "Homework assignment record",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "subject": { "type": "string", "maxLength": 100 },
+        "grade": { "type": "string", "maxLength": 50 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "Submission": {
+      "title": "Submission",
+      "description": "Student exam or assignment submission",
+      "type": "object",
+      "properties": {
+        "studentCode": { "type": "string", "maxLength": 64 },
+        "studentName": { "type": "string", "maxLength": 200 },
+        "score": { "type": "number" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "StudentResult": {
+      "title": "StudentResult",
+      "description": "Aggregated student results record",
+      "type": "object",
+      "properties": {
+        "studentCode": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "Game": {
+      "title": "Game",
+      "description": "Interactive learning game configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "subject": { "type": "string", "maxLength": 100 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "QuizLiveSession": {
+      "title": "QuizLiveSession",
+      "description": "Live interactive quiz room session",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "ScoreRecord": {
+      "title": "ScoreRecord",
+      "description": "Student electronic report score record",
+      "type": "object",
+      "properties": {
+        "studentCode": { "type": "string", "maxLength": 64 },
+        "subject": { "type": "string", "maxLength": 100 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app notification record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "maxLength": 64 }
       }
     },
     "Activity": {
@@ -74,41 +289,169 @@
       "description": "System activity log record",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "ownerId": { "type": "string" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "id": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "SystemCheck": {
+      "title": "SystemCheck",
+      "description": "Firestore connectivity ping document",
+      "type": "object",
+      "properties": {
+        "status": { "type": "string", "maxLength": 64 }
       }
     }
   },
   "firestore": {
-    "/users/{userId}": {
-      "schema": { "$ref": "#/entities/User" },
-      "description": "Collection of user profiles"
-    },
-    "/students/{studentId}": {
-      "schema": { "$ref": "#/entities/Student" },
-      "description": "Collection of student records"
-    },
-    "/lessons/{lessonId}": {
-      "schema": { "$ref": "#/entities/Lesson" },
-      "description": "Collection of lesson plans"
-    },
-    "/questions/{questionId}": {
-      "schema": { "$ref": "#/entities/Question" },
-      "description": "Collection of questions"
-    },
-    "/exams/{examId}": {
-      "schema": { "$ref": "#/entities/Exam" },
-      "description": "Collection of exams"
-    },
-    "/assignments/{assignmentId}": {
-      "schema": { "$ref": "#/entities/Assignment" },
-      "description": "Collection of assignments"
+    "/_system_check_/{checkId}": {
+      "schema": { "$ref": "#/entities/SystemCheck" },
+      "description": "Connectivity check document"
     },
     "/activities/{activityId}": {
       "schema": { "$ref": "#/entities/Activity" },
-      "description": "Collection of activities"
+      "description": "System activity logs"
+    },
+    "/assigned_elearning/{assignId}": {
+      "schema": { "$ref": "#/entities/AssignedElearning" },
+      "description": "Assigned e-learning tasks"
+    },
+    "/assignments/{assignmentId}": {
+      "schema": { "$ref": "#/entities/Assignment" },
+      "description": "Homework assignments"
+    },
+    "/assignments/{assignmentId}/submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Student submissions for an assignment"
+    },
+    "/class_rosters/{rosterId}": {
+      "schema": { "$ref": "#/entities/ClassRoster" },
+      "description": "Class student rosters indexed by class key"
+    },
+    "/classes/{classId}": {
+      "schema": { "$ref": "#/entities/SchoolClass" },
+      "description": "School class configurations"
+    },
+    "/deleted_submissions_backup/{backupId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Backup of deleted submissions"
+    },
+    "/departments/{departmentId}": {
+      "schema": { "$ref": "#/entities/Department" },
+      "description": "Subject departments"
+    },
+    "/elearning_lessons/{lessonId}": {
+      "schema": { "$ref": "#/entities/Lesson" },
+      "description": "E-learning 5E lessons"
+    },
+    "/elearning_student_progress/{progressId}": {
+      "schema": { "$ref": "#/entities/ElearningStudentProgress" },
+      "description": "Student progress in e-learning lessons"
+    },
+    "/exam_drafts/{draftId}": {
+      "schema": { "$ref": "#/entities/ExamDraft" },
+      "description": "Exam draft autosaves"
+    },
+    "/exam_progress/{progressId}": {
+      "schema": { "$ref": "#/entities/ExamProgress" },
+      "description": "Exam progress records"
+    },
+    "/exams/{examId}": {
+      "schema": { "$ref": "#/entities/Exam" },
+      "description": "Exams and assessments"
+    },
+    "/exams/{examId}/submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Student submissions for an exam"
+    },
+    "/games/{gameId}": {
+      "schema": { "$ref": "#/entities/Game" },
+      "description": "Learning games"
+    },
+    "/homeworkAssignments/{assignmentId}": {
+      "schema": { "$ref": "#/entities/Assignment" },
+      "description": "Legacy homework assignments collection"
+    },
+    "/lessonPlans/{lessonId}": {
+      "schema": { "$ref": "#/entities/Lesson" },
+      "description": "Legacy lesson plans collection"
+    },
+    "/lessons/{lessonId}": {
+      "schema": { "$ref": "#/entities/Lesson" },
+      "description": "Core lessons collection"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "User notifications"
+    },
+    "/questions/{questionId}": {
+      "schema": { "$ref": "#/entities/Question" },
+      "description": "Question bank"
+    },
+    "/quiz_live_sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/QuizLiveSession" },
+      "description": "Live quiz sessions"
+    },
+    "/quizzi_games/{gameId}": {
+      "schema": { "$ref": "#/entities/Game" },
+      "description": "Quizzi interactive games"
+    },
+    "/score_records/{recordId}": {
+      "schema": { "$ref": "#/entities/ScoreRecord" },
+      "description": "Student score records"
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SystemSetting" },
+      "description": "Application settings (AI config, etc.)"
+    },
+    "/student_enrollments/{enrollmentId}": {
+      "schema": { "$ref": "#/entities/StudentEnrollment" },
+      "description": "Student enrollments per academic year"
+    },
+    "/student_results/{studentCode}": {
+      "schema": { "$ref": "#/entities/StudentResult" },
+      "description": "Student result summary documents"
+    },
+    "/student_results/{studentCode}/assignments/{assignmentId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Student assignment result details"
+    },
+    "/student_results/{studentCode}/exams/{examId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Student exam result details"
+    },
+    "/student_year_end_results/{resultId}": {
+      "schema": { "$ref": "#/entities/StudentYearEndResult" },
+      "description": "Year-end promotion results"
+    },
+    "/students/{studentId}": {
+      "schema": { "$ref": "#/entities/Student" },
+      "description": "Individual student documents"
+    },
+    "/submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Top-level submissions collection"
+    },
+    "/system_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SystemSetting" },
+      "description": "System registries and settings"
+    },
+    "/teacher_groups/{groupId}": {
+      "schema": { "$ref": "#/entities/TeacherGroup" },
+      "description": "Teacher collaboration groups"
+    },
+    "/teachers/{teacherId}": {
+      "schema": { "$ref": "#/entities/Teacher" },
+      "description": "Teacher profiles"
+    },
+    "/to_chuyen_mon/{departmentId}": {
+      "schema": { "$ref": "#/entities/Department" },
+      "description": "Subject department rosters"
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User accounts and profiles"
     }
   }
 }
