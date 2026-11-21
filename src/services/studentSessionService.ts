@@ -9,35 +9,59 @@ export interface ActiveStudentInfo {
   studentGrade: string;
 }
 
+export function isAuthenticStudentIdentifier(raw?: string | null): boolean {
+  if (!raw || typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  if (['u-4', 'hs-temp', 'hs', 'student', 'guest', 'admin', 'teacher', 'anonymous', 'demo'].includes(lower)) {
+    return false;
+  }
+  // Reject 28-char Firebase Auth UIDs (no dashes, >= 24 alphanumeric chars)
+  if (!trimmed.includes('-') && /^[a-zA-Z0-9]{24,}$/.test(trimmed)) {
+    return false;
+  }
+  return true;
+}
+
 /**
- * Lấy Mã học sinh chuẩn hóa tuyệt đối theo định dạng chuẩn lớp học (ví dụ: 3C26-27-7, 5C26-27-22)
- * Tuyệt đối không trả về Auth UID ngẫu nhiên hay ID generic.
+ * Lấy Mã học sinh chuẩn hóa duy nhất (trim().toUpperCase()).
+ * Ưu tiên tuyệt đối `studentCode` đã có từ session hoặc currentUserId,
+ * KHÔNG phụ thuộc tên học sinh hay trạng thái tải danh sách lớp.
  */
 export function getAuthenticStudentCode(
   session?: any,
   currentUserId?: string,
   targetClass?: string,
-  studentName?: string
+  _studentName?: string
 ): string {
   const sess = session || getCurrentStudentSession();
   const rawClass = sess?.className || sess?.class || targetClass || 'Lớp 5C';
   const cleanClass = normalizeClassKey(rawClass).toUpperCase() || '5C';
 
-  // 1. Kiểm tra ngay nếu bất kỳ mã nào truyền vào đã theo đúng chuẩn [Lớp]26-27-[STT]
-  const candCodes = [
-    sess?.code,
+  // 1. Ưu tiên tuyệt đối mã học sinh trực tiếp từ session hoặc currentUserId (chuẩn hóa trim().toUpperCase())
+  const explicitCodes = [
     sess?.studentCode,
+    sess?.code,
     sess?.maHs,
     currentUserId,
     sess?.id,
     sess?.username
   ].filter(Boolean).map(c => String(c).trim());
 
-  for (const cand of candCodes) {
+  for (const cand of explicitCodes) {
     if (isValidStudentCode(cand)) {
       return normalizeStudentCode(cand);
     }
   }
+
+  for (const cand of explicitCodes) {
+    if (isAuthenticStudentIdentifier(cand)) {
+      return normalizeStudentCode(cand);
+    }
+  }
+
+  const candCodes = explicitCodes;
 
   // 2. Nếu session đã có số thứ tự stt hợp lệ
   if (typeof sess?.stt === 'number' && !isNaN(sess.stt) && sess.stt > 0) {
@@ -75,19 +99,7 @@ export function getAuthenticStudentCode(
   }
 
   if (Array.isArray(roster) && roster.length > 0) {
-    // 3.1 So khớp theo Tên học sinh (ưu tiên tuyệt đối nếu có tên, ví dụ "Tống Nhật Duy")
-    const targetName = (sess?.name || sess?.fullName || studentName || '').trim().toLowerCase();
-    if (targetName && targetName !== 'học sinh' && targetName !== 'student') {
-      const matchByName = roster.find(st => {
-        const sName = (st.fullName || st.name || '').trim().toLowerCase();
-        return sName && (sName === targetName || sName.includes(targetName) || targetName.includes(sName));
-      });
-      if (matchByName) {
-        return formatStandardStudentCode(matchByName.code, cleanClass, matchByName.stt);
-      }
-    }
-
-    // 3.2 So khớp theo Code / ID trong danh sách
+    // 3.1 So khớp theo Code / ID trong danh sách (ưu tiên mã định danh trước)
     for (const cand of candCodes) {
       if (cand && cand !== 'u-4' && cand !== 'hs-temp' && cand.length <= 30) {
         const candNorm = cand.toLowerCase();

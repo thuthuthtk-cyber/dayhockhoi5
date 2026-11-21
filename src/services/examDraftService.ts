@@ -1,7 +1,20 @@
-import { db } from './firebase';
+import { db, auth, ensureFirebaseAuthSession } from './firebase';
+import { signInAnonymously } from 'firebase/auth';
 import { doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { normalizeStudentCode } from './studentCode';
-import { removeUndefined } from './teacherStorageService';
+import { sanitizeForFirestore, sanitizeFirestoreDocId, withFirestoreTimeout } from '../utils/firestoreSanitizer';
+
+async function ensureDraftAuth(): Promise<void> {
+  try {
+    if (auth?.currentUser) return;
+    await withFirestoreTimeout(ensureFirebaseAuthSession(), 5000, 'examDraft.ensureAuth');
+    if (auth && !auth.currentUser) {
+      await withFirestoreTimeout(signInAnonymously(auth), 5000, 'examDraft.signInAnonymously');
+    }
+  } catch (err) {
+    console.warn('[examDraftService] Auth warning:', err);
+  }
+}
 
 export interface ExamDraftRecord {
   id?: string;
@@ -29,7 +42,7 @@ export const EXAM_DRAFTS_COLLECTION = 'exam_drafts';
 export function getDraftStorageKey(rawStudentCode: string, examId: string): string {
   const code = normalizeStudentCode(rawStudentCode);
   const ex = (examId || '').trim();
-  return `${code}_${ex}`;
+  return sanitizeFirestoreDocId(`${code}_${ex}`, 'draft');
 }
 
 /**
@@ -88,8 +101,9 @@ export async function saveExamDraft(
   // 2. Lưu đồng bộ lên Firestore
   if (db) {
     try {
+      await ensureDraftAuth();
       const draftRef = doc(db, EXAM_DRAFTS_COLLECTION, draftId);
-      await setDoc(draftRef, removeUndefined(payload), { merge: true });
+      await setDoc(draftRef, sanitizeForFirestore(payload), { merge: true });
     } catch (err) {
       console.warn('Lỗi lưu nháp bài kiểm tra lên Firestore:', err);
     }
@@ -112,6 +126,7 @@ export async function getExamDraft(
   let draftData: ExamDraftRecord | null = null;
   if (db) {
     try {
+      await ensureDraftAuth();
       const draftRef = doc(db, EXAM_DRAFTS_COLLECTION, draftId);
       const snap = await getDoc(draftRef);
       if (snap.exists()) {
@@ -162,6 +177,7 @@ export async function deleteExamDraft(
   // Xóa Firestore
   if (db) {
     try {
+      await ensureDraftAuth();
       const draftRef = doc(db, EXAM_DRAFTS_COLLECTION, draftId);
       await deleteDoc(draftRef);
     } catch (err) {
@@ -200,6 +216,7 @@ export async function loadAllActiveDraftsForStudent(
   // 2. Quét Firestore
   if (db) {
     try {
+      await ensureDraftAuth();
       const draftsRef = collection(db, EXAM_DRAFTS_COLLECTION);
       const q = query(draftsRef, where('studentCode', '==', normCode));
       const snaps = await getDocs(q);

@@ -49,13 +49,31 @@ import { saveExamDraft, deleteExamDraft, loadAllActiveDraftsForStudent, ExamDraf
 import { generateRuleBasedExamComment } from '../../services/studentCommentAiService';
 import { subscribeToExamsFromFirestore, getExamsFromFirestore, getLocalCachedExams, isExamDeleted, isValidOfficialExam } from '../../services/examStorageService';
 import { removeUndefined } from '../../services/teacherStorageService';
-import { sanitizeForFirestore, normalizeSubmissionAnswers, withFirestoreTimeout } from '../../utils/firestoreSanitizer';
-import { db } from '../../services/firebase';
+import { sanitizeForFirestore, normalizeSubmissionAnswers, withFirestoreTimeout, sanitizeFirestoreDocId, buildCompactEducationalMeta } from '../../utils/firestoreSanitizer';
+import { db, auth, ensureFirebaseAuthSession } from '../../services/firebase';
+import { signInAnonymously } from 'firebase/auth';
 import { doc, runTransaction, setDoc, getDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { getFirestoreDebugStatus } from '../../services/firestoreWriteVerificationService';
 import { formatScore, isSubjectWithScore, getQualitativeLevel, getQualitativeLabel, getCurrentSubmissionTimestamp, formatSubmissionDateTime, parseScoreValue, calculateExamScore } from '../../utils/scoreUtils';
 import { stableShuffle, getMatchingPairColor } from '../../utils/arrayUtils';
 import { invalidateAllSubmissionsCache } from '../../services/hocBaDataService';
+
+async function ensureExamAuthSession(): Promise<boolean> {
+  try {
+    if (auth?.currentUser) return true;
+    await withFirestoreTimeout(ensureFirebaseAuthSession(), 6000, 'StudentExamModule.ensureAuth');
+    if (auth && !auth.currentUser) {
+      await withFirestoreTimeout(signInAnonymously(auth), 6000, 'StudentExamModule.signInAnonymously');
+    }
+    return Boolean(auth?.currentUser);
+  } catch (err) {
+    console.warn('[StudentExamModule] Không thể tự động đăng nhập ẩn danh:', err);
+    return Boolean(auth?.currentUser);
+  }
+}
+
+const getPendingSyncStorageKey = (studentCode: string, examId: string) =>
+  `eduplay_k5_pending_submission_${sanitizeFirestoreDocId(studentCode, 'hs')}_${sanitizeFirestoreDocId(examId, 'exam')}`;
 
 export interface ExamSubmissionItem {
   id: string;
@@ -847,19 +865,17 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
   const [liveTotalCompleted, setLiveTotalCompleted] = useState<number>(0);
   const [liveTotalInProgress, setLiveTotalInProgress] = useState<number>(0);
 
-  // Exam history / submissions for student - Tách riêng biệt độc lập cho Đề kiểm tra (type === 'exam')
+  // Exam history / submissions for student - Chuẩn hóa DUY NHẤT theo studentCode (trim().toUpperCase())
   const session = getCurrentStudentSession();
   const studentInfoSession = getEffectiveStudentClassAndGrade();
-  const cleanClass = (studentInfoSession.studentClass || '5C').replace(/^Lớp\s*/i, '').trim().toUpperCase();
-  const authenticStudentCode = normalizeStudentCode(formatStandardStudentCode(
+  const authenticStudentCode = normalizeStudentCode(
     getAuthenticStudentCode(
       session,
       currentUserId,
       studentInfoSession.studentClass,
       studentInfoSession.studentName || currentUserName
-    ),
-    cleanClass
-  ));
+    )
+  ) || normalizeStudentCode(currentUserId || '') || 'HS';
   const effectiveStudentCode = authenticStudentCode;
   const effectiveStudentName = session?.name || session?.fullName || currentUserName || studentInfoSession.studentName || 'Học sinh';
 
@@ -995,6 +1011,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
 
         // 3. For any liveExam that the student hasn't matched yet, check sub-collection exams/{docId}/submissions/{studentCode}
         if (db && liveExams.length > 0) {
+          await ensureExamAuthSession();
           const promises = liveExams.map(async (ex) => {
             const alreadyMatched = firestoreItems.some(item => isExamSubmissionMatch(item, ex)) ||
                                    localItems.some(item => isExamSubmissionMatch(item, ex));
@@ -2346,9 +2363,9 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
     });
   };
 
-  const executeSubmitExam = async () => {
+  const executeSubmitExam = async (isRetry: boolean = false) => {
     if (!activeExamSession) return;
-    if (hasSubmittedRef.current) {
+    if (!isRetry && hasSubmittedRef.current) {
       console.warn('⚠️ Bài thi đã được nộp thành công trước đó.');
       return;
     }
@@ -2375,11 +2392,14 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
       const questions = exam.questions || [];
       const { answers, answersById } = normalizeSubmissionAnswers(rawAnswers, questions);
 
+      const totalQ = Math.max(1, questions.length);
       let correct = 0;
 
-      questions.forEach((q, idx) => {
+      const questionResults = questions.map((q, idx) => {
+        const studentChoice = answers[String(idx)] !== undefined ? answers[String(idx)] : null;
+        let qCorrectRatio = 0;
+        let qIsCorrect = false;
         try {
-          const studentChoice = answers[String(idx)];
           if (isTrueFalseQuestion(q) && q.statements && q.statements.length > 0) {
             const studentStmts = (typeof studentChoice === 'object' && studentChoice !== null) ? studentChoice : {};
             let qCorrectCount = 0;
@@ -2388,18 +2408,31 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                 qCorrectCount++;
               }
             });
-            correct += (q.statements.length > 0 ? (qCorrectCount / q.statements.length) : 0);
+            qCorrectRatio = q.statements.length > 0 ? (qCorrectCount / q.statements.length) : 0;
+            qIsCorrect = qCorrectRatio === 1;
+            correct += qCorrectRatio;
           } else {
-            if (checkQuestionCorrectLocal(q, studentChoice)) {
-              correct++;
-            }
+            qIsCorrect = checkQuestionCorrectLocal(q, studentChoice);
+            qCorrectRatio = qIsCorrect ? 1 : 0;
+            if (qIsCorrect) correct++;
           }
         } catch (err) {
           console.error(`Error scoring question ${idx}:`, err);
         }
+        const maxPerQ = Number((10 / totalQ).toFixed(2));
+        const earnedPerQ = Number((qCorrectRatio * maxPerQ).toFixed(2));
+        return sanitizeForFirestore({
+          questionIndex: idx,
+          questionId: String(q?.id || `q_${idx}`),
+          type: String(q?.type || (isEssayQuestion(q) ? 'essay' : 'multiple_choice')),
+          isEssay: isEssayQuestion(q),
+          isCorrect: qIsCorrect,
+          score: earnedPerQ,
+          maxScore: maxPerQ,
+          answer: studentChoice,
+        });
       });
 
-      const totalQ = Math.max(1, questions.length);
       const hasScore = isSubjectWithScore(exam.subject);
       const qualitativeLvl = getQualitativeLabel(correct, totalQ);
       const rawScoreNum = Math.round((correct / totalQ) * 10);
@@ -2421,23 +2454,30 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
         const session = getCurrentStudentSession();
         const effectiveInfo = getEffectiveStudentClassAndGrade();
         const effectiveStudentClass = session?.className || effectiveInfo.studentClass || 'Lớp 5C';
-        const effectiveStudentName = session?.name || session?.fullName || effectiveInfo.studentName || currentUserName || 'Học sinh';
-        const cleanClass = (effectiveStudentClass || '5C').replace(/^Lớp\s*/i, '').trim().toUpperCase();
-        const resolvedCode = normalizeStudentCode(formatStandardStudentCode(
-          getAuthenticStudentCode(session, currentUserId, effectiveStudentClass, effectiveStudentName),
-          cleanClass
-        ));
-        const authenticStudentCode = resolvedCode || normalizeStudentCode(currentUserId || '') || 'HS';
+        const effectiveStudentName = String(
+          session?.name || session?.fullName || effectiveInfo.studentName || currentUserName || 'Học sinh'
+        ).slice(0, 200);
+
+        // Chuẩn hóa DUY NHẤT theo studentCode (trim().toUpperCase()), không phụ thuộc tên học sinh hay danh sách lớp
+        const resolvedCode = normalizeStudentCode(
+          getAuthenticStudentCode(session, currentUserId, effectiveStudentClass, effectiveStudentName)
+        );
+        const authenticStudentCode = (resolvedCode || normalizeStudentCode(currentUserId || '') || 'HS').slice(0, 64);
         const effectiveAcademicYear = session?.academicYear || '2026-2027';
 
-        const officialExamId = String(exam.id || '');
+        const officialExamId = String(exam.id || '').trim();
         if (!officialExamId) {
           throw new Error('Không xác định được mã bài làm (examId/assignmentId).');
         }
 
         const attemptNumber = 1;
-        const fixedDocId = `${authenticStudentCode}_${officialExamId}`;
+        const safeStudentDocId = sanitizeFirestoreDocId(authenticStudentCode, 'hs');
+        const fixedDocId = sanitizeFirestoreDocId(`${safeStudentDocId}_${officialExamId}`, safeStudentDocId);
+        const pendingSyncKey = getPendingSyncStorageKey(authenticStudentCode, officialExamId);
+
         const qSnapshot = sanitizeForFirestore((exam.questions || []).map((q: any) => ({ ...q })));
+        const compactExamMeta = buildCompactEducationalMeta(exam);
+        const { submissions: _strippedSubs, ...examForLocalUi } = (exam as any) || {};
 
         const examSub: ExamSubmissionItem = sanitizeForFirestore({
           id: fixedDocId,
@@ -2452,7 +2492,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           sddcn: session?.sddcn || authenticStudentCode,
           studentPersistentId: authenticStudentCode,
           academicYear: effectiveAcademicYear,
-          title: exam.title || 'Bài làm',
+          title: String(exam.title || 'Bài làm').slice(0, 500),
           subject: exam.subject || 'Môn học',
           rank: rankTier,
           score: scoreVal,
@@ -2461,40 +2501,60 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           correctCount: Math.round(correct),
           totalQuestions: totalQ,
           submittedTime: nowTimeStr,
-          exam,
-          assignment: isAssignment ? (exam as any) : null,
+          exam: examForLocalUi,
+          assignment: isAssignment ? examForLocalUi : null,
           questionSnapshot: qSnapshot,
+          questionResults,
           answers,
-          answersById
+          answersById,
+          pendingFirestoreSync: true
         });
 
         const updatedSubmissions = deduplicateExamSubmissions([examSub, ...(examHistory || [])]);
         setExamHistory(updatedSubmissions);
 
-        const rawExamRecord = {
-          ...examSub,
-          recordType: isAssignment ? ('assignment' as const) : ('exam' as const),
+        const feedbackText = scoreNumber >= 8
+          ? 'Làm bài xuất sắc, nắm chắc kiến thức.'
+          : (scoreNumber >= 5 ? 'Đã hoàn thành đạt yêu cầu.' : 'Cần ôn tập và rèn luyện thêm.');
+
+        // Compact Firestore payload: tránh lặp 3 lần danh sách câu hỏi và loại bỏ exam.submissions để không vượt 1MB
+        const fullExamRecord = sanitizeForFirestore({
           id: fixedDocId,
+          type: 'exam' as const,
+          recordType: isAssignment ? ('assignment' as const) : ('exam' as const),
+          submissionType: isAssignment ? ('assignment' as const) : ('exam' as const),
+          examId: officialExamId,
           assignmentId: isAssignment ? officialExamId : null,
           studentId: authenticStudentCode,
+          studentCode: authenticStudentCode,
+          maHs: authenticStudentCode,
           attemptNumber,
           sddcn: session?.sddcn || authenticStudentCode,
           studentPersistentId: authenticStudentCode,
           academicYear: effectiveAcademicYear,
-          studentCode: authenticStudentCode,
-          maHs: authenticStudentCode,
           studentName: effectiveStudentName,
           studentClass: effectiveStudentClass,
+          title: String(exam.title || 'Bài làm').slice(0, 500),
+          subject: exam.subject || 'Môn học',
+          rank: rankTier,
+          score: scoreVal,
           totalScore: scoreNumber,
+          scoreNumber,
+          correctCount: Math.round(correct),
+          totalQuestions: totalQ,
           submittedAt: nowTimeStr,
+          submittedTime: nowTimeStr,
           attempts: 1,
+          exam: compactExamMeta,
+          assignment: isAssignment ? compactExamMeta : null,
           questionSnapshot: qSnapshot,
+          questionResults,
           answers,
           answersById,
           status: 'submitted' as const,
-          feedback: scoreNumber >= 8 ? 'Làm bài xuất sắc, nắm chắc kiến thức.' : (scoreNumber >= 5 ? 'Đã hoàn thành đạt yêu cầu.' : 'Cần ôn tập và rèn luyện thêm.')
-        };
-        const fullExamRecord = sanitizeForFirestore(rawExamRecord);
+          feedback: feedbackText
+        });
+
         const slimExamRecord = sanitizeForFirestore({
           id: fixedDocId,
           examId: officialExamId,
@@ -2511,123 +2571,147 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           rank: rankTier,
           submittedAt: nowTimeStr,
           submittedTime: nowTimeStr,
-          title: exam.title || 'Bài làm',
+          title: String(exam.title || 'Bài làm').slice(0, 500),
           subject: exam.subject || 'Môn học',
           attempts: 1,
+          questionResults,
           answers,
           answersById,
           status: 'submitted' as const,
-          feedback: fullExamRecord.feedback || ''
+          feedback: feedbackText
         });
 
-        // 1. LUÔN lưu dự phòng vào LocalStorage TRƯỚC khi gọi Firestore để không bao giờ mất bài
-        try {
-          localStorage.setItem(`eduplay_k5_student_exam_subs_${authenticStudentCode}`, JSON.stringify(updatedSubmissions));
-          if (currentUserId && normalizeStudentCode(currentUserId) !== authenticStudentCode) {
-            localStorage.setItem(`eduplay_k5_student_exam_subs_${currentUserId}`, JSON.stringify(updatedSubmissions));
-          }
-
-          const allSubsRaw = localStorage.getItem('eduplay_k5_all_exam_submissions');
-          const allSubs = allSubsRaw ? JSON.parse(allSubsRaw) : [];
-          const filteredAll = Array.isArray(allSubs) ? allSubs.filter((s: any) => {
-            const sKey = getSubmissionExamKey(s);
-            const curKey = getSubmissionExamKey(examSub);
-            const sCode = normalizeStudentCode(s.studentCode || s.maHs || s.studentId || s.sddcn || '');
-            return !(sKey === curKey && sCode === authenticStudentCode);
-          }) : [];
-          filteredAll.unshift(fullExamRecord);
-          localStorage.setItem('eduplay_k5_all_exam_submissions', JSON.stringify(deduplicateExamSubmissions(filteredAll)));
-
-          const examSubsRaw = localStorage.getItem(`eduplay_k5_exam_subs_${officialExamId}`);
-          const examSubs = examSubsRaw ? JSON.parse(examSubsRaw) : [];
-          const filteredExamSubs = Array.isArray(examSubs) ? examSubs.filter((s: any) => {
-            const sCode = normalizeStudentCode(s.studentCode || s.maHs || s.studentId || s.sddcn || '');
-            return sCode !== authenticStudentCode;
-          }) : [];
-          filteredExamSubs.unshift(fullExamRecord);
-          localStorage.setItem(`eduplay_k5_exam_subs_${officialExamId}`, JSON.stringify(deduplicateExamSubmissions(filteredExamSubs)));
-
-          if (isAssignment) {
-            const hwSub = sanitizeForFirestore({
-              id: examSub.id,
-              recordType: 'assignment' as const,
-              type: 'assignment' as const,
-              submissionType: 'assignment' as const,
-              assignmentId: officialExamId,
-              studentId: authenticStudentCode,
-              studentCode: authenticStudentCode,
-              maHs: authenticStudentCode,
-              title: exam.title || 'Bài tập',
-              subject: exam.subject || 'Môn học',
-              rank: rankTier,
-              score: scoreVal,
-              submittedTime: nowTimeStr,
-              assignment: {
-                id: exam.id,
-                title: exam.title,
-                subject: exam.subject,
-                grade: exam.grade,
-                questions: exam.questions
-              },
-              questionSnapshot: qSnapshot,
-              answers,
-              answersById
-            });
-            const savedHw = localStorage.getItem(`eduplay_k5_student_submissions_${authenticStudentCode}`);
-            const parsedHw = savedHw ? JSON.parse(savedHw) : [];
-            const nextHw = [hwSub, ...(Array.isArray(parsedHw) ? parsedHw.filter((s: any) => s.id !== hwSub.id) : [])];
-            localStorage.setItem(`eduplay_k5_student_submissions_${authenticStudentCode}`, JSON.stringify(nextHw));
-            if (currentUserId && normalizeStudentCode(currentUserId) !== authenticStudentCode) {
-              localStorage.setItem(`eduplay_k5_student_submissions_${currentUserId}`, JSON.stringify(nextHw));
+        // 1. LUÔN lưu dự phòng vào LocalStorage (kèm cờ chờ đồng bộ) TRƯỚC khi gọi Firestore để không bao giờ mất bài
+        const persistLocalSubmissionState = (isPendingSync: boolean) => {
+          try {
+            if (isPendingSync) {
+              localStorage.setItem(pendingSyncKey, JSON.stringify({
+                studentCode: authenticStudentCode,
+                examId: officialExamId,
+                savedAt: Date.now()
+              }));
+            } else {
+              localStorage.removeItem(pendingSyncKey);
             }
+
+            const syncedHistory = updatedSubmissions.map((s: any) =>
+              s?.id === examSub.id ? { ...s, pendingFirestoreSync: isPendingSync, syncedToFirestore: !isPendingSync } : s
+            );
+            setExamHistory(syncedHistory);
+
+            localStorage.setItem(`eduplay_k5_student_exam_subs_${authenticStudentCode}`, JSON.stringify(syncedHistory));
+            if (currentUserId && normalizeStudentCode(currentUserId) !== authenticStudentCode) {
+              localStorage.setItem(`eduplay_k5_student_exam_subs_${currentUserId}`, JSON.stringify(syncedHistory));
+            }
+
+            const localRecordWithFlag = { ...fullExamRecord, pendingFirestoreSync: isPendingSync, syncedToFirestore: !isPendingSync };
+            const allSubsRaw = localStorage.getItem('eduplay_k5_all_exam_submissions');
+            const allSubs = allSubsRaw ? JSON.parse(allSubsRaw) : [];
+            const filteredAll = Array.isArray(allSubs) ? allSubs.filter((s: any) => {
+              const sKey = getSubmissionExamKey(s);
+              const curKey = getSubmissionExamKey(examSub);
+              const sCode = normalizeStudentCode(s.studentCode || s.maHs || s.studentId || s.sddcn || '');
+              return !(sKey === curKey && sCode === authenticStudentCode);
+            }) : [];
+            filteredAll.unshift(localRecordWithFlag);
+            localStorage.setItem('eduplay_k5_all_exam_submissions', JSON.stringify(deduplicateExamSubmissions(filteredAll)));
+
+            const examSubsRaw = localStorage.getItem(`eduplay_k5_exam_subs_${officialExamId}`);
+            const examSubs = examSubsRaw ? JSON.parse(examSubsRaw) : [];
+            const filteredExamSubs = Array.isArray(examSubs) ? examSubs.filter((s: any) => {
+              const sCode = normalizeStudentCode(s.studentCode || s.maHs || s.studentId || s.sddcn || '');
+              return sCode !== authenticStudentCode;
+            }) : [];
+            filteredExamSubs.unshift(localRecordWithFlag);
+            localStorage.setItem(`eduplay_k5_exam_subs_${officialExamId}`, JSON.stringify(deduplicateExamSubmissions(filteredExamSubs)));
+
+            if (isAssignment) {
+              const hwSub = sanitizeForFirestore({
+                id: examSub.id,
+                recordType: 'assignment' as const,
+                type: 'assignment' as const,
+                submissionType: 'assignment' as const,
+                assignmentId: officialExamId,
+                studentId: authenticStudentCode,
+                studentCode: authenticStudentCode,
+                maHs: authenticStudentCode,
+                title: String(exam.title || 'Bài tập').slice(0, 500),
+                subject: exam.subject || 'Môn học',
+                rank: rankTier,
+                score: scoreVal,
+                totalScore: scoreNumber,
+                scoreNumber,
+                correctCount: Math.round(correct),
+                totalQuestions: totalQ,
+                submittedTime: nowTimeStr,
+                assignment: examForLocalUi,
+                questionSnapshot: qSnapshot,
+                questionResults,
+                answers,
+                answersById,
+                pendingFirestoreSync: isPendingSync,
+                syncedToFirestore: !isPendingSync
+              });
+              const savedHw = localStorage.getItem(`eduplay_k5_student_submissions_${authenticStudentCode}`);
+              const parsedHw = savedHw ? JSON.parse(savedHw) : [];
+              const nextHw = [hwSub, ...(Array.isArray(parsedHw) ? parsedHw.filter((s: any) => s.id !== hwSub.id) : [])];
+              localStorage.setItem(`eduplay_k5_student_submissions_${authenticStudentCode}`, JSON.stringify(nextHw));
+              if (currentUserId && normalizeStudentCode(currentUserId) !== authenticStudentCode) {
+                localStorage.setItem(`eduplay_k5_student_submissions_${currentUserId}`, JSON.stringify(nextHw));
+              }
+            }
+
+            window.dispatchEvent(new Event('eduplay_k5_student_submissions_updated'));
+            window.dispatchEvent(new Event('eduplay_k5_exam_submissions_updated'));
+            window.dispatchEvent(new Event('storage'));
+          } catch (lsErr) {
+            console.error('Lỗi lưu dự phòng LocalStorage:', lsErr);
+          }
+        };
+
+        persistLocalSubmissionState(true);
+
+        // 2. Đảm bảo phiên Firebase Auth (signInAnonymously nếu auth.currentUser đang null) và đồng bộ lên Firestore
+        if (db && officialExamId) {
+          const hasAuth = await ensureExamAuthSession();
+          if (!hasAuth && !auth?.currentUser) {
+            throw new Error('FIREBASE_AUTH_REQUIRED');
           }
 
-          window.dispatchEvent(new Event('eduplay_k5_student_submissions_updated'));
-          window.dispatchEvent(new Event('eduplay_k5_exam_submissions_updated'));
-          window.dispatchEvent(new Event('storage'));
-        } catch (lsErr) {
-          console.error('Lỗi lưu dự phòng LocalStorage:', lsErr);
-        }
-
-        // Xóa bản nháp bài thi
-        deleteExamDraft(authenticStudentCode, officialExamId).catch(() => {});
-        setActiveDrafts(prev => {
-          const next = { ...prev };
-          delete next[officialExamId];
-          return next;
-        });
-
-        // 2. Đồng bộ lên Firestore có timeout an toàn
-        if (db && officialExamId) {
+          const hasPendingLocalBackup = Boolean(localStorage.getItem(pendingSyncKey));
           const targetCol = (isAssignment || officialExamId.startsWith('as-')) ? 'assignments' : 'exams';
           const candDocIds = Array.from(new Set([
             fixedDocId,
-            authenticStudentCode,
-            `${authenticStudentCode}_${officialExamId}_1`
+            safeStudentDocId,
+            sanitizeFirestoreDocId(`${safeStudentDocId}_${officialExamId}_1`, safeStudentDocId)
           ]));
 
           let foundExistingDoc: any = null;
-          try {
-            const existingChecks = await Promise.allSettled(
-              candDocIds.map(async (candId) => {
-                const candDocRef = doc(db, targetCol, officialExamId, 'submissions', candId);
-                const snap = await withFirestoreTimeout(getDoc(candDocRef), 4000, `checkExisting.${candId}`);
-                return snap.exists() ? snap.data() : null;
-              })
-            );
-            for (const res of existingChecks) {
-              if (res.status === 'fulfilled' && res.value) {
-                foundExistingDoc = res.value;
-                break;
+          if (!isRetry && !hasPendingLocalBackup) {
+            try {
+              const existingChecks = await Promise.allSettled(
+                candDocIds.map(async (candId) => {
+                  const candDocRef = doc(db, targetCol, officialExamId, 'submissions', candId);
+                  const snap = await withFirestoreTimeout(getDoc(candDocRef), 4000, `checkExisting.${candId}`);
+                  return snap.exists() ? snap.data() : null;
+                })
+              );
+              for (const res of existingChecks) {
+                if (res.status === 'fulfilled' && res.value) {
+                  foundExistingDoc = res.value;
+                  break;
+                }
               }
+            } catch (checkErr) {
+              console.warn('Tạm bỏ qua bước kiểm tra bài cũ do mạng chậm:', checkErr);
             }
-          } catch (checkErr) {
-            console.warn('Tạm bỏ qua bước kiểm tra bài cũ do mạng chậm:', checkErr);
           }
 
-          if (foundExistingDoc) {
+          if (foundExistingDoc && !isRetry && !hasPendingLocalBackup) {
             console.warn('⚠️ [executeSubmitExam] Học sinh đã có bản ghi bài nộp:', foundExistingDoc.id || fixedDocId);
+            persistLocalSubmissionState(false);
             hasSubmittedRef.current = true;
+            setSubmissionError(null);
             setActiveExamSession(null);
             setToast({
               message: 'Em đã nộp bài này rồi!',
@@ -2645,7 +2729,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
             return;
           }
 
-          const subDocKey = isAssignment ? authenticStudentCode : fixedDocId;
+          const subDocKey = isAssignment ? safeStudentDocId : fixedDocId;
           const mainSubDocRef = doc(db, targetCol, officialExamId, 'submissions', subDocKey);
           const masterDocRef = doc(db, targetCol, officialExamId);
 
@@ -2665,20 +2749,24 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           try {
             await withFirestoreTimeout(
               runTransaction(db, async (transaction) => {
-                const subSnap = await transaction.get(mainSubDocRef);
-                if (subSnap.exists()) {
-                  throw new Error('ALREADY_SUBMITTED');
+                if (!isRetry && !hasPendingLocalBackup) {
+                  const subSnap = await transaction.get(mainSubDocRef);
+                  if (subSnap.exists()) {
+                    throw new Error('ALREADY_SUBMITTED');
+                  }
                 }
                 const masterSnap = await transaction.get(masterDocRef);
                 if (masterSnap.exists()) {
                   const currentData = masterSnap.data();
                   const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
-                  const alreadyInDoc = existingSubs.some((s: any) => {
-                    const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
-                    return sCode === authenticStudentCode;
-                  });
-                  if (alreadyInDoc) {
-                    throw new Error('ALREADY_SUBMITTED');
+                  if (!isRetry && !hasPendingLocalBackup) {
+                    const alreadyInDoc = existingSubs.some((s: any) => {
+                      const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
+                      return sCode === authenticStudentCode;
+                    });
+                    if (alreadyInDoc) {
+                      throw new Error('ALREADY_SUBMITTED');
+                    }
                   }
                   const filtered = existingSubs
                     .filter((s: any) => {
@@ -2686,7 +2774,11 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                       const sId = String(s?.id || '').toLowerCase();
                       return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
                     })
-                    .map((s: any) => sanitizeForFirestore(s));
+                    .map((s: any) => {
+                      // Loại bỏ trường nặng khỏi các bản cũ trong master doc để tránh phình >1MB
+                      const { exam: _e, assignment: _a, questionSnapshot: _q, ...cleanOld } = (s && typeof s === 'object') ? s : {};
+                      return sanitizeForFirestore(cleanOld);
+                    });
                   filtered.unshift(slimExamRecord);
                   const deduplicatedDocSubs = deduplicateExamSubmissions(filtered);
                   const uniqueCodes = Array.from(new Set(
@@ -2704,13 +2796,15 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                 }
                 transaction.set(mainSubDocRef, primarySubPayload, { merge: true });
               }),
-              9000,
+              10000,
               'executeSubmitExam.runTransaction'
             );
             primarySynced = true;
           } catch (txErr: any) {
-            if (txErr?.message === 'ALREADY_SUBMITTED') {
+            if (txErr?.message === 'ALREADY_SUBMITTED' && !isRetry && !hasPendingLocalBackup) {
+              persistLocalSubmissionState(false);
               hasSubmittedRef.current = true;
+              setSubmissionError(null);
               setActiveExamSession(null);
               setToast({
                 message: 'Em đã nộp bài này rồi!',
@@ -2727,10 +2821,10 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
               });
               return;
             }
-            console.warn('runTransaction failed/timeout, fallback to setDoc:', txErr);
+            console.warn('runTransaction failed/timeout, fallback to setDoc on subcollection:', txErr);
             await withFirestoreTimeout(
               setDoc(mainSubDocRef, primarySubPayload, { merge: true }),
-              9000,
+              10000,
               'executeSubmitExam.fallbackSetDoc'
             );
             primarySynced = true;
@@ -2775,12 +2869,12 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
               )
             );
           } else {
-            const asSubDocRef = doc(db, 'assignments', officialExamId, 'submissions', authenticStudentCode);
+            const asSubDocRef = doc(db, 'assignments', officialExamId, 'submissions', safeStudentDocId);
             secondarySyncTasks.push(
               withFirestoreTimeout(
                 setDoc(asSubDocRef, sanitizeForFirestore({
                   ...fullExamRecord,
-                  id: authenticStudentCode,
+                  id: safeStudentDocId,
                   assignmentId: officialExamId,
                   attemptNumber,
                   updatedAt: new Date().toISOString()
@@ -2824,7 +2918,14 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                   score: scoreNumber,
                   maxScore: 10,
                   submittedAt: nowTimeStr,
-                  answers
+                  answers,
+                  answersById,
+                  questionResults,
+                  studentName: effectiveStudentName,
+                  title: String(exam.title || 'Bài tập').slice(0, 500),
+                  subject: exam.subject || 'Môn học',
+                  rank: rankTier,
+                  keepAttempts: 'last'
                 }),
                 8000,
                 'sync.saveAssignmentResult'
@@ -2833,6 +2934,15 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           }
 
           await Promise.allSettled(secondarySyncTasks);
+
+          // Đã ghi Firestore thành công -> xóa cờ chờ đồng bộ & xóa bản nháp làm dở
+          persistLocalSubmissionState(false);
+          deleteExamDraft(authenticStudentCode, officialExamId).catch(() => {});
+          setActiveDrafts(prev => {
+            const next = { ...prev };
+            delete next[officialExamId];
+            return next;
+          });
         }
 
         // Thưởng bài tập / đề kiểm tra
@@ -2850,6 +2960,8 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           try {
             onSubmitted({
               ...examSub,
+              pendingFirestoreSync: false,
+              syncedToFirestore: true,
               alreadySyncedToFirestore: true
             });
           } catch (err) {
@@ -2885,6 +2997,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
       }
 
       hasSubmittedRef.current = true;
+      setSubmissionError(null);
       setToast({
         message: `Nộp bài thành công! Điểm số: ${scoreVal}`,
         type: 'success'
@@ -2904,7 +3017,9 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
     } catch (err: any) {
       console.error('Fatal error during executeSubmitExam:', err);
       hasSubmittedRef.current = false;
-      const isTimeout = String(err?.message || '').includes('FIRESTORE_TIMEOUT');
+      const errMsg = String(err?.message || err?.code || '');
+      const isTimeout = errMsg.includes('FIRESTORE_TIMEOUT');
+      const isAuthErr = errMsg.includes('FIREBASE_AUTH_REQUIRED') || errMsg.includes('permission-denied');
       setToast({
         message: isTimeout
           ? 'Mạng phản hồi chậm. Bài đã lưu tạm trên máy, em bấm "Nộp lại" nhé!'
@@ -2914,6 +3029,8 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
       setSubmissionError(
         isTimeout
           ? 'Máy chủ phản hồi chậm quá thời gian chờ. Bài làm của em đã được lưu dự phòng an toàn trên máy — em hãy kiểm tra mạng rồi bấm "Nộp lại" nhé!'
+          : isAuthErr
+          ? 'Phiên kết nối máy chủ chưa sẵn sàng hoặc đang gián đoạn. Bài làm đã được lưu dự phòng trên máy — em vui lòng bấm "Nộp lại" để đồng bộ ngay!'
           : 'Chưa nộp được lên máy chủ do sự cố kết nối hoặc dữ liệu. Bài làm đã được lưu dự phòng trên máy — em vui lòng bấm "Nộp lại" nhé!'
       );
     } finally {
@@ -4795,7 +4912,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                   type="button"
                   onClick={() => {
                     setSubmissionError(null);
-                    executeSubmitExam();
+                    executeSubmitExam(true);
                   }}
                   className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-black text-xs shadow-md transition-all cursor-pointer shrink-0 active:scale-95 flex items-center gap-2"
                 >
@@ -4819,7 +4936,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
               <button
                 id="btn-submit-exam-or-assignment"
                 disabled={isSubmitting || hasSubmittedRef.current}
-                onClick={submissionError ? () => { setSubmissionError(null); executeSubmitExam(); } : handleManualSubmitConfirm}
+                onClick={submissionError ? () => { setSubmissionError(null); executeSubmitExam(true); } : handleManualSubmitConfirm}
                 className={`py-3 px-8 rounded-2xl text-xs sm:text-sm font-black transition-all shadow-md flex items-center gap-2 relative z-20 ${
                   isSubmitting || hasSubmittedRef.current
                     ? 'bg-slate-300 text-slate-500 border border-slate-300 cursor-not-allowed shadow-none'

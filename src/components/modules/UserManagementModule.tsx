@@ -49,7 +49,7 @@ import {
 } from 'lucide-react';
 import { UserAccount, UserRole, StudentRecord } from '../../types';
 import { PRIMARY_SCHOOL_SUBJECTS } from '../../services/mockData';
-import { STANDARD_GRADE_SUBJECTS, normalizeClassKeyStrict, formatClassName } from '../../services/classStorageService';
+import { STANDARD_GRADE_SUBJECTS, normalizeClassKeyStrict, formatClassName, saveClassToFirestore, syncLocalClassesToFirestoreIfMissing } from '../../services/classStorageService';
 import {
   scanClassDuplicatesFromFirestore,
   createDedupBackupSnapshot,
@@ -58,7 +58,7 @@ import {
   ClassDuplicatePreviewRow
 } from '../../services/classDedupService';
 import { formatScore } from '../../utils/scoreUtils';
-import { groupAndCountErrors } from '../../services/firestoreWriteTracker';
+import { groupAndCountErrors, extractFirestoreErrorDetails } from '../../services/firestoreWriteTracker';
 import {
   downloadStudentImportTemplate,
   exportStudentCredentialsExcel,
@@ -79,6 +79,7 @@ import {
   saveStudentsToLocalStorage,
   saveAllStudentsToLocalStorage,
   syncClassStudentsToFirestore,
+  syncAllLocalRostersToFirestoreIfMissing,
   clearAllStudentsInClass,
   deleteStudentPermanently,
   fetchClassStudentsFromFirestore,
@@ -119,11 +120,12 @@ import {
   normalizeDepartmentName,
   resolveCurrentTeacherProfile
 } from '../../services/teacherStorageService';
-import { db, auth } from '../../services/firebase';
+import { db, auth, ensureFirebaseAuthSessionWithStatus } from '../../services/firebase';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { doc, setDoc, deleteDoc, updateDoc, getDocs, collection, onSnapshot } from 'firebase/firestore';
 import { trackedSetDoc } from '../../services/firestoreWriteTracker';
 import { ConfirmDeleteModal } from '../common/ConfirmDeleteModal';
+import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../../utils/firestoreSanitizer';
 
 export interface TeacherRecord {
   id: string;
@@ -718,9 +720,12 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   const [selectedClass, setSelectedClass] = useState<string | null>(null); // e.g. 'Lớp 3C'
   const [classSubTab, setClassSubTab] = useState<'roster' | 'gradebook'>('roster');
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [firestoreSyncError, setFirestoreSyncError] = useState<string | null>(null);
+  const [isSyncingCloud, setIsSyncingCloud] = useState<boolean>(false);
+
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
     setToast({ message, type });
-    setTimeout(() => setToast(null), 3500);
+    setTimeout(() => setToast(null), 4500);
   };
 
   // Local student records state with LocalStorage & Firestore persistence
@@ -729,7 +734,45 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   });
   const [isStudentsLoading, setIsStudentsLoading] = useState<boolean>(true);
 
-  // 1. Initial Mount Sync: Load from LocalStorage and setup real-time Firestore listeners
+  const handleSyncLocalRostersToCloud = useCallback(async (showFeedback = false) => {
+    if (!db) return;
+    setIsSyncingCloud(true);
+    try {
+      const classesRes = await syncLocalClassesToFirestoreIfMissing(getClassesFromLocalStorage());
+      if (!classesRes.success && classesRes.error) {
+        setFirestoreSyncError(classesRes.error);
+        if (showFeedback) showToast(classesRes.error, 'error');
+        return;
+      }
+
+      const rostersRes = await syncAllLocalRostersToFirestoreIfMissing(activeTeacherProfile);
+      if (!rostersRes.success && rostersRes.error) {
+        setFirestoreSyncError(rostersRes.error);
+        if (showFeedback) showToast(rostersRes.error, 'error');
+        return;
+      }
+
+      setFirestoreSyncError(null);
+      if (showFeedback) {
+        if (rostersRes.syncedClasses.length > 0 || classesRes.syncedCount > 0) {
+          showToast(
+            `✅ Đã đồng bộ ${rostersRes.syncedStudents} học sinh (${rostersRes.syncedClasses.join(', ') || `${classesRes.syncedCount} lớp`}) lên Cloud Firestore!`,
+            'success'
+          );
+        } else {
+          showToast('✅ Dữ liệu lớp học & học sinh trên Cloud Firestore đã khớp đầy đủ!', 'success');
+        }
+      }
+    } catch (err: any) {
+      const details = extractFirestoreErrorDetails(err);
+      setFirestoreSyncError(details.message);
+      if (showFeedback) showToast(details.message, 'error');
+    } finally {
+      setIsSyncingCloud(false);
+    }
+  }, [activeTeacherProfile]);
+
+  // 1. Initial Mount Sync: Load from LocalStorage, push missing local classes/rosters to Firestore, and setup real-time listeners
   useEffect(() => {
     const localDb = getAllStudentsFromLocalStorage();
     if (Object.keys(localDb).length > 0) {
@@ -737,8 +780,11 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       setIsStudentsLoading(false);
     }
 
+    // Tự động đẩy danh sách lớp & học sinh đang có trong LocalStorage lên Firestore (dayhockhoi5) nếu cloud chưa có
+    handleSyncLocalRostersToCloud(false).catch(() => {});
+
     // Proactively fetch all class rosters in parallel from Firestore to prevent timing issues
-    fetchAllStudentsFromFirestore()
+    fetchAllStudentsFromFirestore(activeTeacherProfile)
       .then((remoteDb) => {
         if (remoteDb && Object.keys(remoteDb).length > 0) {
           setStudentDatabase((prev) => ({
@@ -1130,33 +1176,29 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       const res = clearAllStudentsInClass(selectedClass);
 
       // 2. Proactively update Firestore class_rosters document with empty students list
+      let cloudClearErr: string | null = null;
       if (db) {
         try {
-          const rosterRef = doc(db, 'class_rosters', classKey);
-          await setDoc(rosterRef, {
-            className: stdName,
-            classKey,
-            totalStudents: 0,
-            male: 0,
-            female: 0,
-            students: [],
-            updatedAt: new Date().toISOString()
-          }, { merge: true });
-
-          if (classKey !== classKey.toLowerCase()) {
-            const lowerRef = doc(db, 'class_rosters', classKey.toLowerCase());
-            await setDoc(lowerRef, {
+          const authStatus = await ensureFirebaseAuthSessionWithStatus();
+          if (!auth?.currentUser && authStatus.errorCode) {
+            cloudClearErr = authStatus.errorMessage || 'Lỗi xác thực Firebase Auth.';
+          } else {
+            const safeClassKey = sanitizeFirestoreDocId(classKey, '5C');
+            const rosterRef = doc(db, 'class_rosters', safeClassKey);
+            await trackedSetDoc(rosterRef, sanitizeForFirestore({
               className: stdName,
-              classKey: classKey.toLowerCase(),
+              classKey,
               totalStudents: 0,
               male: 0,
               female: 0,
               students: [],
               updatedAt: new Date().toISOString()
-            }, { merge: true });
+            }), { merge: true }, { isUserInitiated: true, actionType: 'admin_batch' });
           }
-        } catch (fbErr) {
-          console.warn('Firestore clear roster doc warning:', fbErr);
+        } catch (fbErr: any) {
+          const details = extractFirestoreErrorDetails(fbErr);
+          cloudClearErr = details.message;
+          console.warn('Firestore clear roster doc warning:', details.message);
         }
       }
 
@@ -1169,15 +1211,20 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         return nextDb;
       });
 
-      if (res.success) {
+      if (cloudClearErr) {
+        setFirestoreSyncError(cloudClearErr);
+        showToast(`Đã xóa trên máy nhưng lỗi đồng bộ Firestore: ${cloudClearErr}`, 'error');
+      } else if (res.success) {
+        setFirestoreSyncError(null);
         showToast(`Đã xóa sạch toàn bộ học sinh lớp ${selectedClass} thành công! Sĩ số hiện tại: 0 học sinh.`, 'success');
       } else {
         showToast(`Đã xóa sạch học sinh lớp ${selectedClass} trong bộ nhớ tạm.`, 'success');
       }
     } catch (err: any) {
       console.error('Lỗi khi xóa toàn bộ học sinh:', err);
-      const errMsg = err?.message || String(err);
-      showToast(`Lỗi khi xóa học sinh: ${errMsg}`, 'error');
+      const details = extractFirestoreErrorDetails(err);
+      setFirestoreSyncError(details.message);
+      showToast(`Lỗi khi xóa học sinh: ${details.message}`, 'error');
     } finally {
       setIsClearingAllStudents(false);
       setIsConfirmClearAllStudentsOpen(false);
@@ -1239,17 +1286,24 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   };
 
   // Confirm Excel Import Batch
-  const handleConfirmExcelImport = () => {
+  const handleConfirmExcelImport = async () => {
     if (!selectedClass) return;
 
     if (!parsedStudentsBatch || parsedStudentsBatch.length === 0) {
-      setToastMessage('⚠️ Chưa có danh sách học sinh hợp lệ để lưu vào lớp.');
-      setTimeout(() => setToastMessage(null), 3000);
+      showToast('⚠️ Chưa có danh sách học sinh hợp lệ để lưu vào lớp.', 'error');
       return;
     }
 
     const studentsToImport = reindexClassStudents(
-      parsedStudentsBatch.map((s) => ({ ...s, className: selectedClass })),
+      parsedStudentsBatch.map((s) => {
+        const normCode = normalizeStudentCode(s.studentCode || s.code);
+        return {
+          ...s,
+          code: normCode || s.code,
+          studentCode: normCode || s.code,
+          className: selectedClass
+        };
+      }),
       selectedClass
     );
 
@@ -1259,29 +1313,26 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     };
     setStudentDatabase(updatedDb);
 
-    // 1. Lưu vĩnh viễn vào LocalStorage (F5 / Reset trang không mất)
+    // 1. Lưu LocalStorage ngay lập tức
     saveStudentsToLocalStorage(selectedClass, studentsToImport);
-
-    // 2. Đồng bộ Firestore Cloud
-    syncClassStudentsToFirestore(selectedClass, studentsToImport)
-      .then((res) => {
-        if (res.success) {
-          setToastMessage(
-            `🎉 Đã nạp & lưu vĩnh viễn ${studentsToImport.length} học sinh vào LocalStorage & Đồng bộ Firestore Cloud thành công cho ${selectedClass}!`
-          );
-        } else {
-          setToastMessage(
-            `💾 Đã lưu vĩnh viễn ${studentsToImport.length} học sinh vào LocalStorage (Offline / Cache sẵn sàng) cho ${selectedClass}!`
-          );
-        }
-        setTimeout(() => {
-          setToastMessage(null);
-        }, 4500);
-      });
 
     setIsExcelModalOpen(false);
     setImportedFile(null);
     setParsedStudentsBatch(null);
+
+    // 2. Ghi trực tiếp lên Firestore (class_rosters & students)
+    const res = await syncClassStudentsToFirestore(selectedClass, studentsToImport);
+    if (res.success) {
+      setFirestoreSyncError(null);
+      showToast(
+        `🎉 Đã nạp & đồng bộ ${studentsToImport.length} học sinh lớp ${selectedClass} lên Cloud Firestore (class_rosters & students) thành công!`,
+        'success'
+      );
+    } else {
+      const errMsg = res.error || 'Không thể ghi danh sách học sinh lên Cloud Firestore.';
+      setFirestoreSyncError(errMsg);
+      showToast(`❌ Lỗi lưu Firestore (${selectedClass}): ${errMsg}`, 'error');
+    }
   };
 
   // Export Student Credentials (Tải danh sách TK & MK cho Phụ huynh dạng .xlsx chuẩn 9 cột)
@@ -1486,6 +1537,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         return {
           ...st,
           code: newCode,
+          studentCode: newCode,
           username: newCode,
           pin: editForm.pin,
           name: editForm.name.trim(),
@@ -1510,20 +1562,31 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     try {
       setStudentDatabase(updatedDb);
       saveStudentsToLocalStorage(selectedClass, updatedList);
-      syncClassStudentsToFirestore(selectedClass, updatedList);
+      const syncCloudRes = await syncClassStudentsToFirestore(selectedClass, updatedList);
 
+      if (!syncCloudRes.success) {
+        const errMsg = syncCloudRes.error || 'Không thể ghi danh sách lên Firestore.';
+        setFirestoreSyncError(errMsg);
+        showToast(`Đã lưu trên máy nhưng lỗi ghi Firestore: ${errMsg}`, 'error');
+        setEditingStudent(null);
+        return;
+      }
+
+      setFirestoreSyncError(null);
       // 2. Nếu đổi mã học sinh: Tự động đổi mã toàn bộ bài nộp, bản nháp, kết quả trên Firestore và LocalStorage
       if (oldCode && newCode && oldCode !== newCode) {
         showToast(`Đang đồng bộ dữ liệu cho mã mới ${newCode}...`, 'success');
         const syncRes = await renameStudentCodeAcrossSystem(oldCode, newCode, editingStudent.id, editForm.name.trim());
         showToast(`Cập nhật thành công! Đã đồng bộ ${syncRes.updatedCount} bản ghi liên quan (bài nộp, nháp, tiến độ, điểm) sang mã ${newCode}!`, 'success');
       } else {
-        showToast('Cập nhật hồ sơ học sinh thành công (đã lưu LocalStorage & Firestore)!', 'success');
+        showToast('Cập nhật hồ sơ học sinh & đồng bộ Cloud Firestore thành công!', 'success');
       }
 
       setEditingStudent(null);
-    } catch (e) {
-      showToast('Lưu hồ sơ học sinh thất bại, vui lòng kiểm tra lại!', 'error');
+    } catch (e: any) {
+      const details = extractFirestoreErrorDetails(e);
+      setFirestoreSyncError(details.message);
+      showToast(`Lưu hồ sơ học sinh thất bại: ${details.message}`, 'error');
     }
   };
 
@@ -1670,10 +1733,9 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   };
 
   // Add student to current class
-  const handleAddStudentToClass = () => {
+  const handleAddStudentToClass = async () => {
     if (!selectedClass || !addForm.name.trim()) {
-      setToastMessage('⚠️ Vui lòng nhập họ và tên học sinh!');
-      setTimeout(() => setToastMessage(null), 3000);
+      showToast('⚠️ Vui lòng nhập họ và tên học sinh!', 'error');
       return;
     }
 
@@ -1687,8 +1749,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       Array.isArray(clsList) && clsList.some(st => normalizeStudentCode(st.code) === normCode)
     );
     if (isDuplicate) {
-      setToastMessage(`⚠️ Mã học sinh "${normCode}" đã tồn tại trong hệ thống! Vui lòng nhập mã học sinh khác.`);
-      setTimeout(() => setToastMessage(null), 4000);
+      showToast(`⚠️ Mã học sinh "${normCode}" đã tồn tại trong hệ thống! Vui lòng nhập mã học sinh khác.`, 'error');
       return;
     }
 
@@ -1696,10 +1757,12 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       id: `std-${Date.now()}`,
       stt: nextStt,
       code: normCode,
+      studentCode: normCode,
       username: normCode,
       pin: addForm.pin || '123456',
       sddcn: addForm.sddcn.trim(),
       name: addForm.name.trim(),
+      fullName: addForm.name.trim(),
       gender: addForm.gender,
       dob: addForm.dob || '10/10/2016',
       className: selectedClass,
@@ -1722,12 +1785,17 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     };
     setStudentDatabase(updatedDb);
     saveStudentsToLocalStorage(selectedClass, updatedList);
-    syncClassStudentsToFirestore(selectedClass, updatedList);
-
-    setToastMessage(`✅ Đã thêm học sinh "${newStudent.name}" (Mã HS: ${normCode}) vào ${selectedClass} thành công!`);
-    setTimeout(() => setToastMessage(null), 4000);
-
     setIsAddStudentModalOpen(false);
+
+    const res = await syncClassStudentsToFirestore(selectedClass, updatedList);
+    if (res.success) {
+      setFirestoreSyncError(null);
+      showToast(`✅ Đã thêm "${newStudent.name}" (Mã HS: ${normCode}) & lưu lên Cloud Firestore thành công!`, 'success');
+    } else {
+      const errMsg = res.error || 'Không thể ghi lên Firestore.';
+      setFirestoreSyncError(errMsg);
+      showToast(`❌ Lỗi lưu học sinh "${newStudent.name}" lên Firestore: ${errMsg}`, 'error');
+    }
   };
 
   // Filter teacher records
@@ -2138,7 +2206,48 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
             Quản lý toàn bộ tài khoản Giáo viên, Học sinh và Lớp học trong hệ thống, thiết lập phân quyền truy cập theo vai trò (RBAC).
           </p>
         </div>
+        <button
+          type="button"
+          disabled={isSyncingCloud}
+          onClick={() => handleSyncLocalRostersToCloud(true)}
+          className="px-4 py-2.5 rounded-xl text-xs font-extrabold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50 shrink-0"
+        >
+          <CloudUpload className={`w-4 h-4 ${isSyncingCloud ? 'animate-bounce' : ''}`} />
+          <span>{isSyncingCloud ? 'Đang đồng bộ Cloud...' : 'Đồng bộ lớp & HS lên Firestore'}</span>
+        </button>
       </div>
+
+      {firestoreSyncError && (
+        <div className="bg-rose-50 border border-rose-200 text-rose-800 px-4 py-3 rounded-2xl flex items-start justify-between gap-3 shadow-xs">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="text-xs font-extrabold text-rose-900">
+                Chưa đồng bộ được danh sách lớp / học sinh lên Cloud Firestore (dayhockhoi5)
+              </p>
+              <p className="text-xs font-medium text-rose-700">{firestoreSyncError}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={isSyncingCloud}
+              onClick={() => handleSyncLocalRostersToCloud(true)}
+              className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold cursor-pointer disabled:opacity-50"
+            >
+              Thử lại
+            </button>
+            <button
+              type="button"
+              onClick={() => setFirestoreSyncError(null)}
+              className="p-1 text-rose-500 hover:text-rose-700 cursor-pointer"
+              aria-label="Đóng cảnh báo"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ======================================================== */}
       {/* NAVIGATION BAR - 2 MAIN TABS                              */}
@@ -2240,27 +2349,33 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                           saveClassesToLocalStorage(restored);
                           setClassesList(restored);
 
-                          try {
-                            for (const c of restored) {
-                              await setDoc(doc(db, 'classes', c.id), {
-                                id: c.id,
-                                name: c.name,
-                                grade: c.grade,
-                                room: c.room || '',
-                                homeroomTeacher: c.homeroomTeacher || '',
-                                homeroomTeacherId: c.homeroomTeacherId || '',
-                                subjects: c.subjects || []
-                              }, { merge: true });
+                          let restoreErr: string | null = null;
+                          for (const c of restored) {
+                            const saveRes = await saveClassToFirestore({
+                              id: c.id,
+                              name: c.name,
+                              grade: c.grade,
+                              room: c.room || '',
+                              homeroomTeacher: c.homeroomTeacher || '',
+                              subjects: c.subjects || []
+                            });
+                            if (!saveRes.success && saveRes.error) {
+                              restoreErr = saveRes.error;
                             }
-                          } catch (err) {
-                            console.warn('Firestore restore classes error:', err);
                           }
 
                           window.dispatchEvent(new Event('eduplay_k5_classes_updated'));
-                          setToastMessage('🔄 Đã khôi phục thành công tất cả các lớp học bị xóa!');
-                          setTimeout(() => setToastMessage(null), 3000);
-                        } catch (e) {
-                          console.error(e);
+                          if (restoreErr) {
+                            setFirestoreSyncError(restoreErr);
+                            showToast(`Đã khôi phục cục bộ nhưng lỗi ghi Firestore: ${restoreErr}`, 'error');
+                          } else {
+                            setFirestoreSyncError(null);
+                            showToast('🔄 Đã khôi phục thành công tất cả các lớp học & đồng bộ Cloud Firestore!', 'success');
+                          }
+                        } catch (e: any) {
+                          const details = extractFirestoreErrorDetails(e);
+                          setFirestoreSyncError(details.message);
+                          showToast(details.message, 'error');
                         }
                       }}
                       className="px-4 py-2.5 rounded-xl text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white transition-all shadow-md flex items-center gap-2 cursor-pointer active:scale-95 whitespace-nowrap"
@@ -4118,26 +4233,28 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
             saveTeachersToLocalStorage(updatedTeachers);
             syncTeachersToFirestore(updatedTeachers);
 
-            try {
-              if (db) {
-                for (const clsItem of updatedClasses) {
-                  const classRef = doc(db, 'classes', clsItem.id);
-                  const payload = {
-                    id: clsItem.id,
-                    name: clsItem.name,
-                    grade: clsItem.grade,
-                    homeroomTeacher: clsItem.homeroomTeacher || '',
-                    subjects: clsItem.subjects || PRIMARY_SCHOOL_SUBJECTS.map(s => ({ isVisible: true, subjectName: s }))
-                  };
-                  await trackedSetDoc(classRef, payload, { merge: true });
-                }
+            let classSaveErr: string | null = null;
+            for (const clsItem of updatedClasses) {
+              const res = await saveClassToFirestore({
+                id: clsItem.id,
+                name: clsItem.name,
+                grade: clsItem.grade,
+                room: clsItem.room || '',
+                homeroomTeacher: clsItem.homeroomTeacher || '',
+                subjects: clsItem.subjects || PRIMARY_SCHOOL_SUBJECTS.map(s => ({ isVisible: true, subjectName: s }))
+              });
+              if (!res.success && res.error) {
+                classSaveErr = res.error;
               }
-            } catch (err) {
-              console.warn('Firestore save class error:', err);
             }
 
-            setToastMessage(toastMsg);
-            setTimeout(() => setToastMessage(null), 3000);
+            if (classSaveErr) {
+              setFirestoreSyncError(classSaveErr);
+              showToast(`Lỗi lưu lớp lên Cloud Firestore: ${classSaveErr}`, 'error');
+            } else {
+              setFirestoreSyncError(null);
+              showToast(toastMsg, 'success');
+            }
             setEditingClass(null);
           }}
         />

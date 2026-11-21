@@ -10,47 +10,52 @@ import {
   Firestore
 } from "firebase/firestore";
 import { getAuth, Auth, signInAnonymously, User } from "firebase/auth";
-import firebaseAppletConfig from "../firebase-applet-config.json";
 
 export const firebaseConfig = {
-  apiKey: firebaseAppletConfig.apiKey,
-  authDomain: firebaseAppletConfig.authDomain,
-  projectId: firebaseAppletConfig.projectId,
-  storageBucket: firebaseAppletConfig.storageBucket,
-  messagingSenderId: firebaseAppletConfig.messagingSenderId,
-  appId: firebaseAppletConfig.appId,
-  measurementId: firebaseAppletConfig.measurementId || "",
-  firestoreDatabaseId: firebaseAppletConfig.firestoreDatabaseId || ""
+  apiKey: "AIzaSyAw3NCg7ZbahpbONrySHo1FirT-qR5lxg4",
+  authDomain: "dayhockhoi5.firebaseapp.com",
+  projectId: "dayhockhoi5",
+  storageBucket: "dayhockhoi5.firebasestorage.app",
+  messagingSenderId: "577591823358",
+  appId: "1:577591823358:web:d36801def8bb8a17308eaf",
+  measurementId: "G-KM8S8ZCTYY"
 };
 
 export const app: FirebaseApp = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
 export let analytics: Analytics | null = null;
 if (typeof window !== 'undefined' && firebaseConfig.measurementId) {
-  isSupported()
-    .then((supported) => {
-      if (supported) {
-        analytics = getAnalytics(app);
-      }
-    })
-    .catch(() => {
-      // Ignore analytics errors in restricted browser/iframe environments
-    });
+  try {
+    isSupported()
+      .then((supported) => {
+        if (supported) {
+          try {
+            analytics = getAnalytics(app);
+          } catch {
+            analytics = null;
+          }
+        }
+      })
+      .catch(() => {
+        analytics = null;
+      });
+  } catch {
+    analytics = null;
+  }
 }
 
-// Khởi tạo Cloud Firestore bằng getFirestore(app, firestoreDatabaseId) với cơ chế fallback initializeFirestore
+// Khởi tạo Cloud Firestore cho dự án Khối 5 (dayhockhoi5) với fallback an toàn
 export const db: Firestore = (() => {
-  const dbId = firebaseConfig.firestoreDatabaseId;
   try {
-    return dbId ? getFirestore(app, dbId) : getFirestore(app);
-  } catch {
     const settings = {
       experimentalAutoDetectLongPolling: true,
       localCache: persistentLocalCache({
         tabManager: persistentSingleTabManager({})
       }),
     };
-    return dbId ? initializeFirestore(app, settings, dbId) : initializeFirestore(app, settings);
+    return initializeFirestore(app, settings);
+  } catch {
+    return getFirestore(app);
   }
 })();
 
@@ -58,9 +63,14 @@ export const auth: Auth = getAuth(app);
 
 let pendingAnonymousAuthPromise: Promise<User | null> | null = null;
 let lastAuthErrorCode: string | null = null;
+let lastAuthErrorMessage: string | null = null;
 
 export function getLastAuthErrorCode(): string | null {
   return lastAuthErrorCode;
+}
+
+export function getLastAuthErrorMessage(): string | null {
+  return lastAuthErrorMessage;
 }
 
 /**
@@ -68,9 +78,14 @@ export function getLastAuthErrorCode(): string | null {
  * Nếu auth.currentUser đang null, gọi signInAnonymously(auth) trong try/catch.
  */
 export async function ensureFirebaseAuthSession(): Promise<User | null> {
-  if (!auth) return null;
+  if (!auth) {
+    lastAuthErrorCode = 'auth/not-initialized';
+    lastAuthErrorMessage = 'Firebase Auth chưa được khởi tạo.';
+    return null;
+  }
   if (auth.currentUser) {
     lastAuthErrorCode = null;
+    lastAuthErrorMessage = null;
     return auth.currentUser;
   }
 
@@ -82,10 +97,12 @@ export async function ensureFirebaseAuthSession(): Promise<User | null> {
     try {
       const cred = await signInAnonymously(auth);
       lastAuthErrorCode = null;
+      lastAuthErrorMessage = null;
       return cred.user;
     } catch (err: any) {
       lastAuthErrorCode = err?.code || 'auth/anonymous-failed';
-      console.warn('[Firebase Auth] Không thể tự động đăng nhập ẩn danh (signInAnonymously):', lastAuthErrorCode, err?.message || err);
+      lastAuthErrorMessage = err?.message || String(err);
+      console.warn('[Firebase Auth] Không thể tự động đăng nhập ẩn danh (signInAnonymously):', lastAuthErrorCode, lastAuthErrorMessage);
       return auth.currentUser || null;
     } finally {
       pendingAnonymousAuthPromise = null;
@@ -93,6 +110,25 @@ export async function ensureFirebaseAuthSession(): Promise<User | null> {
   })();
 
   return pendingAnonymousAuthPromise;
+}
+
+export async function ensureFirebaseAuthSessionWithStatus(): Promise<{
+  user: User | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}> {
+  const user = await ensureFirebaseAuthSession();
+  if (user) {
+    return { user, errorCode: null, errorMessage: null };
+  }
+  const code = lastAuthErrorCode || 'auth/no-current-user';
+  let message = lastAuthErrorMessage || 'Chưa có phiên xác thực Firebase Auth.';
+  if (code === 'auth/operation-not-allowed' || code === 'auth/admin-restricted-operation') {
+    message = `Mã lỗi [${code}]: Dự án Firebase "dayhockhoi5" chưa bật đăng nhập Ẩn danh (Anonymous) trong Authentication -> Sign-in method hoặc giáo viên chưa đăng nhập Google.`;
+  } else if (!message.includes(code)) {
+    message = `Mã lỗi [${code}]: ${message}`;
+  }
+  return { user: null, errorCode: code, errorMessage: message };
 }
 
 // Bộ đếm số lần xảy ra Internal Assertion trong phiên

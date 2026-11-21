@@ -45,9 +45,24 @@ import {
 } from '../../services/assignmentStorageService';
 import { syncAssignmentQuestions } from '../../services/assignmentSyncService';
 import { formatScore, isSubjectWithScore, getQualitativeLevel, getQualitativeLabel, getCurrentSubmissionTimestamp, formatSubmissionDateTime, parseScoreValue, calculateExamScore } from '../../utils/scoreUtils';
-import { sanitizeForFirestore, normalizeSubmissionAnswers, withFirestoreTimeout } from '../../utils/firestoreSanitizer';
-import { db } from '../../services/firebase';
-import { doc, getDoc, setDoc, runTransaction, onSnapshot } from 'firebase/firestore';
+import { sanitizeForFirestore, normalizeSubmissionAnswers, withFirestoreTimeout, sanitizeFirestoreDocId } from '../../utils/firestoreSanitizer';
+import { db, auth, ensureFirebaseAuthSession } from '../../services/firebase';
+import { signInAnonymously } from 'firebase/auth';
+import { doc, getDoc, setDoc, runTransaction } from 'firebase/firestore';
+
+async function ensureAssignmentAuthSession(): Promise<boolean> {
+  try {
+    if (auth?.currentUser) return true;
+    await withFirestoreTimeout(ensureFirebaseAuthSession(), 6000, 'StudentAssignmentModule.ensureAuth');
+    if (auth && !auth.currentUser) {
+      await withFirestoreTimeout(signInAnonymously(auth), 6000, 'StudentAssignmentModule.signInAnonymously');
+    }
+    return Boolean(auth?.currentUser);
+  } catch (err) {
+    console.warn('[StudentAssignmentModule] Không thể tự động đăng nhập ẩn danh:', err);
+    return Boolean(auth?.currentUser);
+  }
+}
 
 interface StudentAssignmentModuleProps {
   assignments: HomeworkAssignment[];
@@ -234,6 +249,9 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
   const [solvingAssignment, setSolvingAssignment] = useState<HomeworkAssignment | null>(null);
   const [detailSubmission, setDetailSubmission] = useState<{ assignment: HomeworkAssignment; score: string; time: string; answers: Record<number, any>; title: string; subject: string; rank: string } | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [submissionSyncError, setSubmissionSyncError] = useState<string | null>(null);
+  const [pendingRetryPayload, setPendingRetryPayload] = useState<any | null>(null);
+  const [isRetryingSync, setIsRetryingSync] = useState<boolean>(false);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -276,7 +294,9 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
 
     const fetchStudentResultsOnce = async () => {
       try {
-        const studentResultRef = doc(db, 'student_results', effectiveUserId);
+        await ensureAssignmentAuthSession();
+        const safeDocCode = sanitizeFirestoreDocId(effectiveUserId, 'hs');
+        const studentResultRef = doc(db, 'student_results', safeDocCode);
         const docSnap = await getDoc(studentResultRef);
         if (isCancelled || !docSnap.exists()) return;
 
@@ -481,17 +501,29 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
     totalQuestions?: number;
     alreadySyncedToFirestore?: boolean;
   }) => {
-    const authenticCode = normalizeStudentCode(newSub.studentId || effectiveUserId);
+    const authenticCode = (normalizeStudentCode(newSub.studentId || effectiveUserId) || 'HS').slice(0, 64);
+    const safeStudentDocId = sanitizeFirestoreDocId(authenticCode, 'hs');
     const questions = newSub.assignment?.questions || [];
     const totalQuestions = Math.max(1, questions.length);
     const { answers: normalizedAnswers, answersById } = normalizeSubmissionAnswers(newSub.answers, questions);
 
     let correctCount = 0;
-    questions.forEach((q, idx) => {
-      const studentChoice = normalizedAnswers[String(idx)];
-      if (checkQuestionCorrectLocal(q, studentChoice)) {
+    const questionResults = questions.map((q, idx) => {
+      const studentChoice = normalizedAnswers[String(idx)] !== undefined ? normalizedAnswers[String(idx)] : null;
+      const qIsCorrect = checkQuestionCorrectLocal(q, studentChoice);
+      if (qIsCorrect) {
         correctCount++;
       }
+      const maxPerQ = Number((10 / totalQuestions).toFixed(2));
+      return sanitizeForFirestore({
+        questionIndex: idx,
+        questionId: String(q?.id || `q_${idx}`),
+        type: String(q?.type || 'multiple_choice'),
+        isCorrect: qIsCorrect,
+        score: qIsCorrect ? maxPerQ : 0,
+        maxScore: maxPerQ,
+        answer: studentChoice,
+      });
     });
 
     const hasScore = isSubjectWithScore(newSub.subject || newSub.assignment?.subject);
@@ -509,10 +541,13 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
 
     const formattedScore = hasScore ? String(numScore) : (newSub.score || getQualitativeLabel(correctCount, totalQuestions));
     const safeSubmittedTime = formatSubmissionDateTime(newSub.submittedTime || getCurrentSubmissionTimestamp());
-    const assignmentId = String(newSub.assignment?.id || newSub.id || '');
+    const assignmentId = String(newSub.assignment?.id || newSub.id || '').trim();
+    const safeSubId = sanitizeFirestoreDocId(newSub.id || `${safeStudentDocId}_${assignmentId}`, safeStudentDocId);
+    const safeStudentName = String(effectiveUserName || 'Học sinh').slice(0, 200);
 
     const subWithStudent: AssignmentSubmissionItem = sanitizeForFirestore({
       ...newSub,
+      id: safeSubId,
       recordType: 'assignment',
       type: 'assignment',
       submissionType: 'assignment',
@@ -524,35 +559,51 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
       submittedTime: safeSubmittedTime,
       answers: normalizedAnswers,
       answersById,
+      questionResults,
+      pendingFirestoreSync: !newSub.alreadySyncedToFirestore,
+      syncedToFirestore: Boolean(newSub.alreadySyncedToFirestore),
     });
 
-    const newKey = getCanonicalAssignmentKey(subWithStudent);
-    const remaining = assignmentHistory.filter(s => getCanonicalAssignmentKey(s) !== newKey);
-    const updatedList = deduplicateAssignmentSubmissions([subWithStudent, ...remaining]);
-    setAssignmentHistory(updatedList);
+    const saveLocalBackup = (isPendingSync: boolean) => {
+      const flaggedItem: any = {
+        ...subWithStudent,
+        pendingFirestoreSync: isPendingSync,
+        syncedToFirestore: !isPendingSync,
+      };
+      const newKey = getCanonicalAssignmentKey(flaggedItem);
+      const remaining = assignmentHistory.filter(s => getCanonicalAssignmentKey(s) !== newKey);
+      const updatedList = deduplicateAssignmentSubmissions([flaggedItem, ...remaining]);
+      setAssignmentHistory(updatedList);
 
-    try {
-      localStorage.setItem(`eduplay_k5_student_submissions_${authenticCode}`, JSON.stringify(updatedList));
-      window.dispatchEvent(new Event('eduplay_k5_student_submissions_updated'));
-    } catch (err) {
-      console.error('Error saving student assignment submission to localStorage:', err);
-    }
+      try {
+        localStorage.setItem(`eduplay_k5_student_submissions_${authenticCode}`, JSON.stringify(updatedList));
+        window.dispatchEvent(new Event('eduplay_k5_student_submissions_updated'));
+      } catch (err) {
+        console.error('Error saving student assignment submission to localStorage:', err);
+      }
+    };
+
+    saveLocalBackup(!newSub.alreadySyncedToFirestore);
 
     const submissionRecord = sanitizeForFirestore({
-      id: newSub.id || `${authenticCode}_${assignmentId}`,
+      id: safeSubId,
       recordType: 'assignment' as const,
       assignmentId,
       studentId: authenticCode,
       studentCode: authenticCode,
       maHs: authenticCode,
       code: authenticCode,
-      studentName: effectiveUserName || 'Học sinh',
+      studentName: safeStudentName,
+      title: String(newSub.title || newSub.assignment?.title || 'Bài tập').slice(0, 500),
+      subject: String(newSub.subject || newSub.assignment?.subject || 'Môn học'),
+      rank: String(newSub.rank || 'Hoàn thành'),
       score: numScore,
       totalScore: numScore,
       correctCount,
       totalQuestions,
       submittedAt: safeSubmittedTime,
       submittedTime: safeSubmittedTime,
+      questionResults,
       answers: normalizedAnswers,
       answersById,
       status: 'submitted' as const
@@ -574,55 +625,74 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
       onSaveAssignment(updatedAssignment);
     }
 
-    // Nếu StudentExamModule đã đồng bộ trực tiếp lên Firestore thì không lặp lại transaction gây xung đột
-    if (!newSub.alreadySyncedToFirestore && db && assignmentId) {
+    // Nếu StudentExamModule đã đồng bộ trực tiếp lên Firestore thì xóa cờ pending & không lặp lại transaction gây xung đột
+    if (newSub.alreadySyncedToFirestore) {
+      setSubmissionSyncError(null);
+      setPendingRetryPayload(null);
+      saveLocalBackup(false);
+      return;
+    }
+
+    if (db && assignmentId) {
+      setSubmissionSyncError(null);
+      const hasAuth = await ensureAssignmentAuthSession();
+      if (!hasAuth && !auth?.currentUser) {
+        setPendingRetryPayload(newSub);
+        setSubmissionSyncError('Chưa nộp được lên máy chủ do chưa thiết lập được phiên kết nối. Bài làm đã được lưu dự phòng trên máy — em vui lòng bấm "Nộp lại" nhé!');
+        return;
+      }
+
       const assignRef = doc(db, 'assignments', assignmentId);
-      const subDocRef = doc(db, 'assignments', assignmentId, 'submissions', authenticCode);
+      const subDocRef = doc(db, 'assignments', assignmentId, 'submissions', safeStudentDocId);
+      let firestoreSynced = false;
 
       try {
         await withFirestoreTimeout(
           runTransaction(db, async (transaction) => {
             const assignSnap = await transaction.get(assignRef);
-            let existingSubs: any[] = [];
             if (assignSnap.exists()) {
               const currentData = assignSnap.data();
-              existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
+              const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
+
+              const filtered = existingSubs
+                .filter((s: any) => {
+                  const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || '');
+                  return sCode !== authenticCode;
+                })
+                .map((s: any) => {
+                  const { exam: _e, assignment: _a, questionSnapshot: _q, ...cleanOld } = (s && typeof s === 'object') ? s : {};
+                  return sanitizeForFirestore(cleanOld);
+                });
+
+              filtered.push(submissionRecord);
+
+              const uniqueStudentKeys = new Set(
+                filtered
+                  .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || ''))
+                  .filter(Boolean)
+              );
+              const count = uniqueStudentKeys.size;
+              const submittedIdsList = Array.from(uniqueStudentKeys);
+
+              transaction.update(assignRef, sanitizeForFirestore({
+                submissions: filtered,
+                submittedIds: submittedIdsList,
+                submittedCount: count,
+                completedCount: count,
+                updatedAt: new Date().toISOString()
+              }));
             }
-
-            const filtered = existingSubs
-              .filter((s: any) => {
-                const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || '');
-                return sCode !== authenticCode;
-              })
-              .map((s: any) => sanitizeForFirestore(s));
-
-            filtered.push(submissionRecord);
-
-            const uniqueStudentKeys = new Set(
-              filtered
-                .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || ''))
-                .filter(Boolean)
-            );
-            const count = uniqueStudentKeys.size;
-            const submittedIdsList = Array.from(uniqueStudentKeys);
 
             transaction.set(subDocRef, sanitizeForFirestore({
               ...submissionRecord,
               assignmentId,
               updatedAt: new Date().toISOString()
             }), { merge: true });
-
-            transaction.set(assignRef, sanitizeForFirestore({
-              submissions: filtered,
-              submittedIds: submittedIdsList,
-              submittedCount: count,
-              completedCount: count,
-              updatedAt: new Date().toISOString()
-            }), { merge: true });
           }),
           10000,
           'StudentAssignmentModule.runTransaction'
         );
+        firestoreSynced = true;
       } catch (e) {
         console.warn('⚠️ [Transaction Nộp Bài] Lỗi/Timeout, thử lưu trực tiếp subcollection:', e);
         try {
@@ -632,43 +702,62 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
               assignmentId,
               updatedAt: new Date().toISOString()
             }), { merge: true }),
-            8000,
+            9000,
             'StudentAssignmentModule.fallbackSetDoc'
           );
+          firestoreSynced = true;
         } catch (fallbackErr) {
           console.warn('⚠️ [Fallback setDoc Nộp Bài] Đã lưu dự phòng LocalStorage:', fallbackErr);
         }
       }
 
-      try {
-        await withFirestoreTimeout(
+      const secondaryResults = await Promise.allSettled([
+        withFirestoreTimeout(
           studentResultService.saveAssignmentResult(authenticCode, {
             assignmentId,
             score: numScore,
             maxScore: 10,
             submittedAt: safeSubmittedTime,
             answers: normalizedAnswers,
+            answersById,
+            questionResults,
+            studentName: safeStudentName,
+            title: String(newSub.title || newSub.assignment?.title || 'Bài tập').slice(0, 500),
+            subject: String(newSub.subject || newSub.assignment?.subject || 'Môn học'),
+            rank: String(newSub.rank || 'Hoàn thành'),
             keepAttempts: 'last'
           }),
           8000,
           'StudentAssignmentModule.saveAssignmentResult'
-        );
-      } catch (resErr) {
-        console.warn('⚠️ Lỗi cập nhật student_results (đã lưu dự phòng LocalStorage):', resErr);
+        ),
+        withFirestoreTimeout(
+          studentResultService.saveFullAssignmentSubmission(authenticCode, assignmentId, submissionRecord),
+          8000,
+          'StudentAssignmentModule.saveFullAssignmentSubmission'
+        )
+      ]);
+
+      const anyResultSynced = secondaryResults.some(r => r.status === 'fulfilled');
+      if (!firestoreSynced && !anyResultSynced) {
+        setPendingRetryPayload(newSub);
+        setSubmissionSyncError('Chưa nộp được lên máy chủ do sự cố kết nối hoặc dữ liệu. Bài làm đã được lưu dự phòng trên máy — em vui lòng bấm "Nộp lại" nhé!');
+        return;
       }
+
+      saveLocalBackup(false);
+      setSubmissionSyncError(null);
+      setPendingRetryPayload(null);
     }
 
-    if (!newSub.alreadySyncedToFirestore) {
-      awardAssignmentReward(
-        authenticCode,
-        assignmentId,
-        newSub.title,
-        correctCount,
-        totalQuestions,
-        numScore
-      );
-      showToast(`🎉 Nộp bài thành công! Điểm số của em: ${formattedScore}`);
-    }
+    awardAssignmentReward(
+      authenticCode,
+      assignmentId,
+      newSub.title,
+      correctCount,
+      totalQuestions,
+      numScore
+    );
+    showToast(`🎉 Nộp bài thành công! Điểm số của em: ${formattedScore}`);
   };
 
   // Phân loại dữ liệu độc lập: loại trừ các bài giảng E-Learning, lọc theo lớp học và khử trùng lặp triệt để
@@ -695,11 +784,11 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
     // Sắp xếp bài tập ưu tiên bài khớp chính xác với lớp học sinh hoặc bài học sinh đã nộp
     const sortedFiltered = [...filtered].sort((a, b) => {
       // Ưu tiên bài mà học sinh hiện tại đã có bài nộp
-      const aHasSub = Array.isArray(a.submissions) && a.submissions.some((s: any) => 
-        (effectiveUserId && (s.studentId === effectiveUserId || s.code === effectiveUserId || s.studentCode === effectiveUserId))
+      const aHasSub = Array.isArray(a.submissions) && a.submissions.some((s: any) =>
+        normalizeStudentCode(s.studentCode || s.maHs || s.studentId || s.code || '') === effectiveUserId
       );
-      const bHasSub = Array.isArray(b.submissions) && b.submissions.some((s: any) => 
-        (effectiveUserId && (s.studentId === effectiveUserId || s.code === effectiveUserId || s.studentCode === effectiveUserId))
+      const bHasSub = Array.isArray(b.submissions) && b.submissions.some((s: any) =>
+        normalizeStudentCode(s.studentCode || s.maHs || s.studentId || s.code || '') === effectiveUserId
       );
       if (aHasSub && !bHasSub) return -1;
       if (!aHasSub && bHasSub) return 1;
@@ -772,8 +861,8 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
     const completedAssignments = todoAssignments.filter(as => {
       const subs = Array.isArray(as.submissions) ? as.submissions : [];
       const hasSub = subs.some((s: any) => {
-        const sid = String(s.studentId || s.studentCode || s.maHs || s.code || '').trim().toLowerCase();
-        return sid === effectiveUserId.toLowerCase();
+        const sid = normalizeStudentCode(String(s.studentCode || s.maHs || s.studentId || s.code || ''));
+        return sid === effectiveUserId;
       }) || historySubmissions.some(sub => sub.assignment?.id === as.id || sub.id === as.id);
       return hasSub;
     });
@@ -921,6 +1010,32 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
         <div className="fixed top-6 right-6 z-50 bg-emerald-900 text-white px-5 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-bounce">
           <Sparkles className="w-5 h-5 text-amber-300" />
           <span className="text-sm font-bold">{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Pending Firestore Retry Banner (only shown if direct submission failed) */}
+      {submissionSyncError && pendingRetryPayload && (
+        <div className="p-4 bg-rose-50 border-2 border-rose-200 text-rose-900 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-3 shadow-md">
+          <div className="flex items-center gap-2.5 text-xs sm:text-sm font-bold">
+            <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
+            <span>{submissionSyncError}</span>
+          </div>
+          <button
+            type="button"
+            disabled={isRetryingSync}
+            onClick={async () => {
+              if (isRetryingSync || !pendingRetryPayload) return;
+              setIsRetryingSync(true);
+              try {
+                await handleAddNewSubmission(pendingRetryPayload);
+              } finally {
+                setIsRetryingSync(false);
+              }
+            }}
+            className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white font-black text-xs shadow-md transition-all cursor-pointer shrink-0"
+          >
+            {isRetryingSync ? 'Đang nộp lại...' : 'Nộp lại'}
+          </button>
         </div>
       )}
 

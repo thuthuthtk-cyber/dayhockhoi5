@@ -1,13 +1,36 @@
-import { db, auth } from './firebase';
-import { collection, doc, getDocs, onSnapshot } from 'firebase/firestore';
+import { db, auth, ensureFirebaseAuthSessionWithStatus } from './firebase';
+import { signInAnonymously } from 'firebase/auth';
+import { collection, doc, getDocs, onSnapshot, query, where, Query } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch, extractFirestoreErrorDetails } from './firestoreWriteTracker';
 import { HomeworkAssignment } from '../types';
-import { INITIAL_ASSIGNMENTS } from './mockData';
-import { removeUndefined, getCurrentTeacherProfile, resolveCurrentTeacherProfile } from './teacherStorageService';
+import { getCurrentTeacherProfile, resolveCurrentTeacherProfile } from './teacherStorageService';
 import { waitForWriteConfirmation, updateCollectionCacheStatus } from './firestoreWriteVerificationService';
 import { normalizeClassKey } from './studentStorageService';
 import { normalizeStudentCode } from './studentCode';
+import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../utils/firestoreSanitizer';
+import { isAdmin, getAllAccessibleClasses, canManageClass, UserPermissionsProfile } from '../utils/permissions';
 import './orderingMigrationService';
+
+async function ensureAssignAuth(): Promise<{ ok: boolean; error?: string; code?: string }> {
+  try {
+    if (auth?.currentUser) return { ok: true };
+    const status = await ensureFirebaseAuthSessionWithStatus();
+    if (status.user || auth?.currentUser) return { ok: true };
+    if (auth) {
+      const cred = await signInAnonymously(auth);
+      if (cred.user) return { ok: true };
+    }
+    return {
+      ok: false,
+      error: status.errorMessage || 'Chưa có phiên xác thực Firebase Auth.',
+      code: status.errorCode || 'auth/no-current-user'
+    };
+  } catch (err: any) {
+    const details = extractFirestoreErrorDetails(err);
+    console.warn('[assignmentStorageService] Auth warning:', details.message);
+    return { ok: false, error: details.message, code: details.code };
+  }
+}
 
 const ASSIGNMENTS_CACHE_KEY = 'eduplay_k5_cached_assignments';
 
@@ -118,9 +141,11 @@ export function saveAssignmentsToLocalStorage(assignments: HomeworkAssignment[])
 import { extractGradeDigit } from '../lib/constants';
 
 /**
- * Save a HomeworkAssignment to Firestore
+ * Save a HomeworkAssignment directly to Firestore (`assignments` collection)
  */
-export async function saveAssignmentToFirestore(assignment: HomeworkAssignment): Promise<void> {
+export async function saveAssignmentToFirestore(
+  assignment: HomeworkAssignment
+): Promise<{ success: boolean; error?: string; code?: string }> {
   try {
     const targetDigit = extractGradeDigit(assignment.targetClass) || extractGradeDigit(assignment.grade) || '5';
     const normalizedGrade = `Khối ${targetDigit}`;
@@ -141,7 +166,7 @@ export async function saveAssignmentToFirestore(assignment: HomeworkAssignment):
       !assignment.teacherId ||
       assignment.teacherId === 'u-4' ||
       assignment.teacherId === 'gv-temp' ||
-      assignment.teacherId.length > 10 || // Firebase Auth UIDs are 28 characters long
+      assignment.teacherId.length > 10 ||
       (currentEmail.includes('thuthuthtk') && assignment.teacherId !== 'gv-12');
 
     if (isInvalidTeacherId) {
@@ -161,17 +186,24 @@ export async function saveAssignmentToFirestore(assignment: HomeworkAssignment):
       assignment.teacherName = profile.name;
     }
 
-    // Ensure teacherEmail is populated
     assignment.teacherEmail = profile.email || currentEmail;
 
-    // Ensure createdBy is business ID, NEVER Auth UID
     if (assignment.createdBy && assignment.createdBy.length > 10) {
       assignment.createdBy = profile.id;
     } else if (!assignment.createdBy) {
       assignment.createdBy = profile.id;
     }
 
-    // 1. Always update local cache first (strict ID matching only, never overwrite different assignments)
+    // Enforce ID structure: as-[ID]-class-lp[classKey]
+    if (!assignment.id.startsWith('as-') || !assignment.id.includes('-class-lp')) {
+      const classKey = normalizeClassKey(assignment.targetClass || assignment.grade || '5C');
+      const baseId = assignment.id.replace(/^as-/, '').replace(/-class-.*$/, '');
+      assignment.id = sanitizeFirestoreDocId(`as-${baseId}-class-lp${classKey.toLowerCase()}`, `as-${Date.now()}`);
+    } else {
+      assignment.id = sanitizeFirestoreDocId(assignment.id, `as-${Date.now()}`);
+    }
+
+    // 1. Always update local cache first (strict ID matching only)
     const current = getLocalCachedAssignments();
     const existsIdx = current.findIndex(a => a.id === assignment.id);
     let updated: HomeworkAssignment[];
@@ -184,45 +216,38 @@ export async function saveAssignmentToFirestore(assignment: HomeworkAssignment):
     saveAssignmentsToLocalStorage(updated);
 
     if (!db) {
-      console.warn('Firestore chưa sẵn sàng, lưu cache cục bộ bài tập');
-      return;
+      return {
+        success: false,
+        error: 'Chưa khởi tạo kết nối Cloud Firestore.',
+        code: 'firestore/not-initialized'
+      };
     }
 
-    // Enforce ID structure: as-[ID]-class-lp[classKey]
-    if (!assignment.id.startsWith('as-') || !assignment.id.includes('-class-lp')) {
-      const classKey = normalizeClassKey(assignment.targetClass || assignment.grade || '5C');
-      const baseId = assignment.id.replace(/^as-/, '').replace(/-class-.*$/, '');
-      assignment.id = `as-${baseId}-class-lp${classKey.toLowerCase()}`;
+    const authResult = await ensureAssignAuth();
+    if (!authResult.ok && !auth?.currentUser) {
+      return {
+        success: false,
+        error: authResult.error || 'Chưa có phiên xác thực Firebase Auth để ghi dữ liệu.',
+        code: authResult.code || 'auth/no-current-user'
+      };
     }
 
     const assignRef = doc(db, 'assignments', assignment.id);
-    const cleanedPayload = removeUndefined({
+    const cleanedPayload = sanitizeForFirestore({
       ...assignment,
       id: assignment.id,
       grade: normalizedGrade,
+      questions: Array.isArray(assignment.questions) ? assignment.questions : [],
+      submissions: Array.isArray(assignment.submissions) ? assignment.submissions : [],
       updatedAt: new Date().toISOString()
     });
 
-    console.log(`[DEBUG] Saving Assignment to Firestore:`, {
-      docId: assignment.id,
-      payload: cleanedPayload
-    });
-
-    try {
-      await trackedSetDoc(assignRef, cleanedPayload, { merge: true });
-    } catch (setDocErr: any) {
-    // ...
-      const errDetails = extractFirestoreErrorDetails(setDocErr);
-      console.error(`❌ [LỖI FIRESTORE TỪ CHỐI LƯU BÀI TẬP KHỐI ${normalizedGrade}]`, {
-        message: errDetails.message,
-        code: errDetails.code,
-        assignmentId: assignment.id,
-        grade: normalizedGrade,
-        targetClass: assignment.targetClass,
-        payload: cleanedPayload
-      });
-      throw new Error(errDetails.message);
-    }
+    await trackedSetDoc(
+      assignRef,
+      cleanedPayload,
+      { merge: true },
+      { isUserInitiated: true, actionType: 'user_action' }
+    );
 
     const writeResult = await waitForWriteConfirmation(assignRef, 12000, false);
     if (writeResult.success) {
@@ -230,30 +255,113 @@ export async function saveAssignmentToFirestore(assignment: HomeworkAssignment):
     } else {
       console.warn(`⚠️ [Chưa xác nhận máy chủ Khối ${normalizedGrade}] ${writeResult.message}`);
     }
-  } catch (error) {
-    console.error(`❌ [Lỗi giao/lưu bài tập Khối ${assignment?.grade || '5'} lên Firestore]:`, error);
+
+    return { success: true };
+  } catch (error: any) {
+    const details = extractFirestoreErrorDetails(error);
+    console.error(`❌ [Lỗi giao/lưu bài tập Khối ${assignment?.grade || '5'} lên Firestore]:`, details.message);
+    return { success: false, error: details.message, code: details.code };
   }
 }
 
 /**
- * Fetch all assignments from Firestore
+ * Tự động đẩy các bài tập đang có trong LocalStorage lên Firestore nếu cloud collection đang trống
  */
-export async function getAssignmentsFromFirestore(): Promise<HomeworkAssignment[]> {
+export async function syncLocalAssignmentsToFirestoreIfCloudEmpty(
+  userProfile?: UserPermissionsProfile | null
+): Promise<{ success: boolean; syncedCount: number; error?: string; code?: string }> {
+  try {
+    if (!db) {
+      return { success: false, syncedCount: 0, error: 'Chưa khởi tạo Cloud Firestore.', code: 'firestore/not-initialized' };
+    }
+    const localList = getLocalCachedAssignments();
+    if (!localList || localList.length === 0) {
+      return { success: true, syncedCount: 0 };
+    }
+
+    const authResult = await ensureAssignAuth();
+    if (!authResult.ok && !auth?.currentUser) {
+      return { success: false, syncedCount: 0, error: authResult.error, code: authResult.code };
+    }
+
+    const qRef = buildAssignmentsQueryForUser(userProfile);
+    const snap = await getDocs(qRef);
+    if (!snap.empty) {
+      return { success: true, syncedCount: 0 };
+    }
+
+    let syncedCount = 0;
+    for (const item of localList) {
+      if (!item || !item.id) continue;
+      if (userProfile && !isAdmin(userProfile) && item.targetClass && !canManageClass(userProfile, item.targetClass)) {
+        continue;
+      }
+      const res = await saveAssignmentToFirestore({ ...item });
+      if (!res.success) {
+        return { success: false, syncedCount, error: res.error, code: res.code };
+      }
+      syncedCount++;
+    }
+    return { success: true, syncedCount };
+  } catch (err: any) {
+    const details = extractFirestoreErrorDetails(err);
+    return { success: false, syncedCount: 0, error: details.message, code: details.code };
+  }
+}
+
+function buildAssignmentsQueryForUser(userProfile?: UserPermissionsProfile | null): Query | ReturnType<typeof collection> {
+  const baseCol = collection(db, 'assignments');
+  if (!userProfile || isAdmin(userProfile)) {
+    return baseCol;
+  }
+  const accessible = getAllAccessibleClasses(userProfile);
+  const classVariants = Array.from(
+    new Set(
+      accessible.flatMap((c) => [c, `Lớp ${c}`]).filter(Boolean)
+    )
+  ).slice(0, 30);
+
+  if (classVariants.length > 0) {
+    return query(baseCol, where('targetClass', 'in', classVariants));
+  }
+  if (userProfile.email) {
+    return query(baseCol, where('teacherEmail', '==', userProfile.email.trim().toLowerCase()));
+  }
+  return query(baseCol, where('grade', '==', 'Khối 5'));
+}
+
+let hasAttemptedCloudAssignmentPush = false;
+
+/**
+ * Fetch all assignments from Firestore (Admin: toàn quyền; Teacher: lọc theo permissions.ts & where())
+ */
+export async function getAssignmentsFromFirestore(userProfile?: UserPermissionsProfile | null): Promise<HomeworkAssignment[]> {
   try {
     if (!db) return getLocalCachedAssignments();
 
-    const snap = await getDocs(collection(db, 'assignments'));
+    await ensureAssignAuth();
+    const qRef = buildAssignmentsQueryForUser(userProfile);
+    const snap = await getDocs(qRef);
     if (!snap.empty) {
       const items: HomeworkAssignment[] = [];
       snap.forEach(docSnap => {
-        items.push({ id: docSnap.id, ...docSnap.data() } as HomeworkAssignment);
+        const item = { id: docSnap.id, ...(docSnap.data() as any) } as HomeworkAssignment;
+        if (!userProfile || isAdmin(userProfile) || canManageClass(userProfile, item.targetClass) || !item.targetClass) {
+          items.push(item);
+        }
       });
-      saveAssignmentsToLocalStorage(items);
+      if (!userProfile || isAdmin(userProfile)) {
+        saveAssignmentsToLocalStorage(items);
+      }
       return items;
     }
 
-    // Nếu rỗng, không gieo mầm dữ liệu mẫu
-    saveAssignmentsToLocalStorage([]);
+    const localCached = getLocalCachedAssignments();
+    if (localCached.length > 0) {
+      return localCached.filter(
+        (item) => !userProfile || isAdmin(userProfile) || canManageClass(userProfile, item.targetClass) || !item.targetClass
+      );
+    }
     return [];
   } catch (error) {
     console.warn("Lỗi đọc danh sách bài tập từ Firestore:", error);
@@ -266,7 +374,8 @@ export async function getAssignmentsFromFirestore(): Promise<HomeworkAssignment[
  */
 export function subscribeToAssignmentsFromFirestore(
   onUpdate: (assignments: HomeworkAssignment[]) => void,
-  onError?: (err: any) => void
+  onError?: (err: any) => void,
+  userProfile?: UserPermissionsProfile | null
 ) {
   if (!db) {
     onUpdate(getLocalCachedAssignments());
@@ -274,7 +383,7 @@ export function subscribeToAssignmentsFromFirestore(
   }
 
   try {
-    const colRef = collection(db, 'assignments');
+    const colRef = buildAssignmentsQueryForUser(userProfile);
     return onSnapshot(
       colRef,
       (snapshot) => {
@@ -286,15 +395,30 @@ export function subscribeToAssignmentsFromFirestore(
         if (!snapshot.empty) {
           const loaded: HomeworkAssignment[] = [];
           snapshot.forEach((docSnap) => {
-            loaded.push({ id: docSnap.id, ...docSnap.data() } as HomeworkAssignment);
+            const item = { id: docSnap.id, ...(docSnap.data() as any) } as HomeworkAssignment;
+            if (!userProfile || isAdmin(userProfile) || canManageClass(userProfile, item.targetClass) || !item.targetClass) {
+              loaded.push(item);
+            }
           });
           const cleanLoaded = deduplicateAssignments(loaded);
           cleanLoaded.sort((a, b) => (b.id > a.id ? 1 : -1));
-          saveAssignmentsToLocalStorage(cleanLoaded);
+          if (!userProfile || isAdmin(userProfile)) {
+            saveAssignmentsToLocalStorage(cleanLoaded);
+          }
           onUpdate(cleanLoaded);
         } else {
-          saveAssignmentsToLocalStorage([]);
-          onUpdate([]);
+          const localCached = getLocalCachedAssignments().filter(
+            (item) => !userProfile || isAdmin(userProfile) || canManageClass(userProfile, item.targetClass) || !item.targetClass
+          );
+          if (localCached.length > 0) {
+            onUpdate(localCached);
+            if (!isFromCache && !hasAttemptedCloudAssignmentPush) {
+              hasAttemptedCloudAssignmentPush = true;
+              syncLocalAssignmentsToFirestoreIfCloudEmpty(userProfile).catch(() => {});
+            }
+          } else {
+            onUpdate([]);
+          }
         }
       },
       (err) => {

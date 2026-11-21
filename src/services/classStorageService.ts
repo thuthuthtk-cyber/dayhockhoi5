@@ -1,5 +1,8 @@
-import { collection, onSnapshot, getDocs } from 'firebase/firestore';
-import { db } from '../firebaseConfig';
+import { collection, doc, onSnapshot, getDocs } from 'firebase/firestore';
+import { signInAnonymously } from 'firebase/auth';
+import { db, auth, ensureFirebaseAuthSessionWithStatus } from '../firebaseConfig';
+import { trackedSetDoc, extractFirestoreErrorDetails } from './firestoreWriteTracker';
+import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../utils/firestoreSanitizer';
 import { useState, useEffect, useMemo } from 'react';
 // import { safeStorage } from '../utils/safeStorage';
 
@@ -112,6 +115,120 @@ export function extractGradeDigit(str?: string): string {
   if (!str) return '';
   const match = str.match(/\d+/);
   return match ? match[0] : '';
+}
+
+/**
+ * Lưu một lớp học lên Cloud Firestore (`classes` collection) với auth & làm sạch dữ liệu
+ */
+export async function saveClassToFirestore(
+  classItem: SchoolClassItem
+): Promise<{ success: boolean; error?: string; code?: string }> {
+  try {
+    if (!db) {
+      return { success: false, error: 'Chưa khởi tạo kết nối Cloud Firestore.', code: 'firestore/not-initialized' };
+    }
+
+    let authStatus = await ensureFirebaseAuthSessionWithStatus();
+    if (!authStatus.user && auth && !auth.currentUser) {
+      try {
+        const cred = await signInAnonymously(auth);
+        authStatus = { user: cred.user, errorCode: null, errorMessage: null };
+      } catch (anonErr: any) {
+        const details = extractFirestoreErrorDetails(anonErr);
+        return { success: false, error: details.message, code: details.code };
+      }
+    }
+    if (!auth?.currentUser && authStatus.errorCode) {
+      return { success: false, error: authStatus.errorMessage || 'Chưa xác thực Firebase Auth.', code: authStatus.errorCode };
+    }
+
+    const classKey = normalizeClassKeyStrict(classItem.name || classItem.id);
+    if (!classKey || isExcludedClassKey(classKey)) {
+      return { success: false, error: 'Mã lớp không hợp lệ hoặc không thuộc Khối 5.', code: 'invalid-argument' };
+    }
+
+    const docId = sanitizeFirestoreDocId(classKey, 'class_5c');
+    const stdName = formatClassName(classKey);
+    const payload = sanitizeForFirestore({
+      id: classKey,
+      name: stdName,
+      grade: 'Khối 5',
+      room: classItem.room || '',
+      homeroomTeacher: classItem.homeroomTeacher || '',
+      subjects: Array.isArray(classItem.subjects) && classItem.subjects.length > 0
+        ? classItem.subjects
+        : STANDARD_GRADE_SUBJECTS['Khối 5'].map(s => ({ isVisible: true, subjectName: s })),
+      updatedAt: new Date().toISOString()
+    });
+
+    await trackedSetDoc(
+      doc(db, 'classes', docId),
+      payload,
+      { merge: true },
+      { isUserInitiated: true, actionType: 'user_action' }
+    );
+    return { success: true };
+  } catch (err: any) {
+    const details = extractFirestoreErrorDetails(err);
+    return { success: false, error: details.message, code: details.code };
+  }
+}
+
+/**
+ * Tự động đẩy danh sách lớp Khối 5 từ LocalStorage lên Firestore nếu trên cloud chưa có
+ */
+export async function syncLocalClassesToFirestoreIfMissing(
+  localClasses?: SchoolClassItem[]
+): Promise<{ success: boolean; syncedCount: number; error?: string; code?: string }> {
+  try {
+    if (!db) {
+      return { success: false, syncedCount: 0, error: 'Chưa khởi tạo Cloud Firestore.', code: 'firestore/not-initialized' };
+    }
+
+    const authStatus = await ensureFirebaseAuthSessionWithStatus();
+    if (!auth?.currentUser && authStatus.errorCode) {
+      return { success: false, syncedCount: 0, error: authStatus.errorMessage || 'Lỗi xác thực Firebase Auth.', code: authStatus.errorCode };
+    }
+
+    let sourceList: SchoolClassItem[] = Array.isArray(localClasses) ? localClasses : [];
+    if (sourceList.length === 0 && typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem('eduplay_k5_classes_config');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) sourceList = parsed;
+        }
+      } catch {}
+    }
+    const dedupedLocal = deduplicateClassItems(sourceList.length > 0 ? sourceList : REAL_SCHOOL_CLASSES_FALLBACK);
+    if (dedupedLocal.length === 0) {
+      return { success: true, syncedCount: 0 };
+    }
+
+    const cloudSnap = await getDocs(collection(db, 'classes'));
+    const existingKeys = new Set<string>();
+    cloudSnap.forEach((d) => {
+      const data = d.data();
+      const k = normalizeClassKeyStrict(data?.name || data?.className || d.id);
+      if (k) existingKeys.add(k);
+    });
+
+    let syncedCount = 0;
+    for (const cls of dedupedLocal) {
+      const key = normalizeClassKeyStrict(cls.name || cls.id);
+      if (!key || existingKeys.has(key)) continue;
+      const res = await saveClassToFirestore(cls);
+      if (!res.success) {
+        return { success: false, syncedCount, error: res.error, code: res.code };
+      }
+      syncedCount++;
+    }
+
+    return { success: true, syncedCount };
+  } catch (err: any) {
+    const details = extractFirestoreErrorDetails(err);
+    return { success: false, syncedCount: 0, error: details.message, code: details.code };
+  }
 }
 
 /**

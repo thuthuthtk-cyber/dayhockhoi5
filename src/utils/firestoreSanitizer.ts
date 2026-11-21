@@ -172,3 +172,53 @@ export function withFirestoreTimeout<T>(
     }
   });
 }
+
+/**
+ * Ensures a Firestore document ID satisfies `isValidId(id)`:
+ * `id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_.@-]+$')`
+ */
+export function sanitizeFirestoreDocId(rawId: string | undefined | null, fallback = 'doc'): string {
+  const normalized = String(rawId || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[đĐ]/g, 'd')
+    .replace(/[–—−]/g, '-')
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9_.@-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+  const base = normalized || fallback;
+  if (base.length <= 120) return base;
+
+  // Deterministic short hash suffix when truncating long IDs to preserve uniqueness
+  let hash = 0;
+  for (let i = 0; i < base.length; i++) {
+    hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
+  }
+  const suffix = Math.abs(hash).toString(36).slice(0, 8);
+  return `${base.slice(0, 110)}_${suffix}`;
+}
+
+/**
+ * Strips heavy/nested `submissions` arrays and redundant fields from an exam/assignment object
+ * before embedding metadata inside a submission document so Firestore stays well under 1MB.
+ */
+export function buildCompactEducationalMeta(source: any): Record<string, any> | null {
+  if (!source || typeof source !== 'object') return null;
+  const meta: Record<string, any> = {
+    id: String(source.id || ''),
+    title: String(source.title || '').slice(0, 500),
+    subject: String(source.subject || ''),
+    grade: String(source.grade || ''),
+    durationMinutes: Number.isFinite(Number(source.durationMinutes)) ? Number(source.durationMinutes) : null,
+    examType: source.examType || null,
+    targetClass: source.targetClass || null,
+    originalExamId: source.originalExamId || null,
+    originalAssignmentId: source.originalAssignmentId || null,
+    teacherId: source.teacherId || null,
+    teacherName: source.teacherName || null,
+  };
+  return sanitizeForFirestore(meta);
+}
+

@@ -8,9 +8,29 @@ import {
   updateDoc, 
   onSnapshot
 } from 'firebase/firestore';
-import { app, analytics, db, auth, firebaseConfig } from '../firebaseConfig';
+import { 
+  app, 
+  analytics, 
+  db, 
+  auth, 
+  firebaseConfig,
+  ensureFirebaseAuthSession,
+  ensureFirebaseAuthSessionWithStatus,
+  getLastAuthErrorCode,
+  getLastAuthErrorMessage
+} from '../firebaseConfig';
 
-export { app, analytics, db, auth, firebaseConfig };
+export { 
+  app, 
+  analytics, 
+  db, 
+  auth, 
+  firebaseConfig,
+  ensureFirebaseAuthSession,
+  ensureFirebaseAuthSessionWithStatus,
+  getLastAuthErrorCode,
+  getLastAuthErrorMessage
+};
 export const googleProvider = new GoogleAuthProvider();
 
 export enum OperationType {
@@ -86,25 +106,34 @@ export const loginWithGoogle = async () => {
 // Logout helper
 export const logoutUser = () => signOut(auth);
 
-// Generic Firestore Realtime Subscription helper for the 7 required collections:
-// students, lessons, questions, exams, assignments, users, activities
+// Generic Firestore Realtime Subscription helper for collections
 export const subscribeToCollection = <T>(
   collectionName: 'students' | 'lessons' | 'questions' | 'exams' | 'assignments' | 'users' | 'activities',
   onUpdate: (data: T[]) => void,
   onError: (err: FirestoreErrorInfo) => void
 ) => {
-  const colRef = collection(db, collectionName);
-  
-  return onSnapshot(colRef, (snapshot) => {
-    const items = snapshot.docs.map(docSnap => ({
-      id: docSnap.id,
-      ...docSnap.data()
-    })) as T[];
-    onUpdate(items);
-  }, (error) => {
+  try {
+    if (!db) {
+      onUpdate([]);
+      return () => {};
+    }
+    const colRef = collection(db, collectionName);
+
+    return onSnapshot(colRef, (snapshot) => {
+      const items = snapshot.docs.map(docSnap => ({
+        id: docSnap.id,
+        ...docSnap.data()
+      })) as T[];
+      onUpdate(items);
+    }, (error) => {
+      const errObj = handleFirestoreError(error, OperationType.LIST, collectionName);
+      onError(errObj);
+    });
+  } catch (error) {
     const errObj = handleFirestoreError(error, OperationType.LIST, collectionName);
     onError(errObj);
-  });
+    return () => {};
+  }
 };
 
 // Generic Document Writer with mandatory ownerId, createdAt, updatedAt
@@ -113,17 +142,18 @@ export const saveFirestoreDoc = async (
   docId: string | null,
   data: Record<string, any>
 ) => {
-  const currentUid = auth.currentUser?.uid || 'system_guest';
-  const now = new Date().toISOString();
-
-  const payload = {
-    ...data,
-    ownerId: data.ownerId || currentUid,
-    updatedAt: now,
-    ...(docId ? {} : { createdAt: now })
-  };
-
   try {
+    await ensureFirebaseAuthSession();
+    const currentUid = auth.currentUser?.uid || 'system_guest';
+    const now = new Date().toISOString();
+
+    const payload = {
+      ...data,
+      ownerId: data.ownerId || currentUid,
+      updatedAt: now,
+      ...(docId ? {} : { createdAt: now })
+    };
+
     if (docId) {
       const docRef = doc(db, collectionName, docId);
       await updateDoc(docRef, payload);

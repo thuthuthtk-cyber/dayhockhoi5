@@ -401,6 +401,7 @@ export interface StudentRecord {
   id: string;
   stt: number;
   code: string;
+  studentCode?: string;
   sddcn: string;
   studentPersistentId?: string;
   academicYear?: string;

@@ -4,10 +4,23 @@ import {
   setDoc, 
   onSnapshot, 
   query, 
-  where,
-  getDocs
+  where
 } from 'firebase/firestore';
-import { db } from './firebase';
+import { signInAnonymously } from 'firebase/auth';
+import { db, auth, ensureFirebaseAuthSession } from './firebase';
+import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../utils/firestoreSanitizer';
+
+async function ensureLiveAuth(): Promise<void> {
+  try {
+    if (auth?.currentUser) return;
+    await ensureFirebaseAuthSession();
+    if (auth && !auth.currentUser) {
+      await signInAnonymously(auth);
+    }
+  } catch (err) {
+    console.warn('[liveQuizSessionService] Auth warning:', err);
+  }
+}
 
 export interface LiveQuizParticipant {
   id: string; // doc ID: targetId_studentId
@@ -36,9 +49,7 @@ const LOCAL_STORAGE_KEY_PREFIX = 'eduplay_k5_live_quiz_';
 
 // Helper to sanitize doc ID for Firestore
 function getDocId(targetId: string, studentId: string): string {
-  const cleanTarget = String(targetId || 'target').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const cleanStudent = String(studentId || 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
-  return `${cleanTarget}_${cleanStudent}`;
+  return sanitizeFirestoreDocId(`${targetId || 'target'}_${studentId || 'student'}`, 'live_quiz');
 }
 
 // Clean up any legacy seed records & old cached quiz sessions from localStorage
@@ -126,8 +137,9 @@ export async function joinQuizLiveSession(params: {
   // 2. Sync to Firestore
   if (!db) return;
   try {
+    await ensureLiveAuth();
     const docRef = doc(db, COLLECTION_NAME, docId);
-    await setDoc(docRef, data, { merge: true });
+    await setDoc(docRef, sanitizeForFirestore(data), { merge: true });
   } catch (err) {
     console.warn('Firestore joinQuizLiveSession error:', err);
   }
@@ -160,15 +172,16 @@ export async function updateQuizLiveProgress(params: {
   updateDebounceTimers[debounceKey] = setTimeout(async () => {
     try {
       if (!db) return;
+      await ensureLiveAuth();
       const docRef = doc(db, COLLECTION_NAME, docId);
       await setDoc(
         docRef,
-        {
+        sanitizeForFirestore({
           answeredCount: safeAnsweredCount,
           ...(totalQuestions ? { totalQuestions } : {}),
           updatedAt: now,
           status: 'in_progress'
-        },
+        }),
         { merge: true }
       );
     } catch (err) {
@@ -242,8 +255,9 @@ export async function completeQuizLiveSession(params: {
   // 2. Update Firestore
   if (!db) return;
   try {
+    await ensureLiveAuth();
     const docRef = doc(db, COLLECTION_NAME, docId);
-    await setDoc(docRef, patch, { merge: true });
+    await setDoc(docRef, sanitizeForFirestore(patch), { merge: true });
   } catch (err) {
     console.warn('Firestore completeQuizLiveSession error:', err);
   }

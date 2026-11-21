@@ -3,22 +3,27 @@ import express from 'express';
 import path from 'path';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, getDoc } from 'firebase/firestore';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, Firestore } from 'firebase/firestore';
 import mammoth from 'mammoth';
 
 const firebaseConfig = {
-  apiKey: "AIzaSyBReZ5OAXtkr1JAwQcyYni-UZKrqyjZ4Tw",
-  authDomain: "hoctapkhoi3.firebaseapp.com",
-  projectId: "hoctapkhoi3",
-  storageBucket: "hoctapkhoi3.firebasestorage.app",
-  messagingSenderId: "1030190205977",
-  appId: "1:1030190205977:web:8826e16b125ef5edc9ee88",
-  measurementId: "G-PZW8Y0FB2J"
+  apiKey: "AIzaSyAw3NCg7ZbahpbONrySHo1FirT-qR5lxg4",
+  authDomain: "dayhockhoi5.firebaseapp.com",
+  projectId: "dayhockhoi5",
+  storageBucket: "dayhockhoi5.firebasestorage.app",
+  messagingSenderId: "577591823358",
+  appId: "1:577591823358:web:d36801def8bb8a17308eaf",
+  measurementId: "G-KM8S8ZCTYY"
 };
 
-const appFb = initializeApp(firebaseConfig);
-const db = getFirestore(appFb);
+let db: Firestore | null = null;
+try {
+  const appFb = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+  db = getFirestore(appFb);
+} catch (fbErr) {
+  console.warn('Firebase initialization warning in server.ts:', fbErr);
+}
 
 // Modern supported models (excluding deprecated models)
 const RECOMMENDED_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
@@ -50,7 +55,7 @@ async function startServer() {
   // Helper to initialize Gemini Client with fallback to Firestore global API key
   const getGeminiClient = async (customKey?: string) => {
     let apiKey = customKey || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    if (!apiKey && db) {
       try {
         const configDocRef = doc(db, 'settings', 'ai_config');
         const configSnap = await getDoc(configDocRef);

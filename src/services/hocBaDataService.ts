@@ -5,7 +5,7 @@ import { getCurrentActiveAcademicYear, getStudentClassInfo } from './studentStor
 import { normalizeStudentCode, isValidStudentCode, getRecordType } from './studentCode';
 import { formatScore, roundTotalScore, formatTotalScore, getCurrentSubmissionTimestamp, formatSubmissionDateTime } from '../utils/scoreUtils';
 import { formatDateTimeVN } from '../utils/dateTimeUtils';
-import { db } from './firebase';
+import { db, ensureFirebaseAuthSession } from './firebase';
 import { query, collection, where, getDocs } from 'firebase/firestore';
 
 export { formatScore, roundTotalScore, formatTotalScore, getCurrentSubmissionTimestamp, formatSubmissionDateTime };
@@ -1430,6 +1430,7 @@ export function calculateOverallClassification(
  */
 export async function fetchClassScoreRecords(classId: string, recordType: 'exam' | 'assignment', sourceId: string, examType?: string) {
   try {
+    await ensureFirebaseAuthSession();
     let q = query(
       collection(db, 'score_records'),
       where('classId', '==', classId),
@@ -1447,8 +1448,9 @@ export async function fetchClassScoreRecords(classId: string, recordType: 'exam'
     
     snapshot.forEach((docSnap) => {
       const data = docSnap.data();
-      if (data.studentCode) {
-        recordsMap[data.studentCode] = data;
+      const normalizedCode = normalizeStudentCode(data.studentCode || data.maHs || data.studentId || '');
+      if (normalizedCode) {
+        recordsMap[normalizedCode] = { ...data, studentCode: normalizedCode };
       }
     });
 

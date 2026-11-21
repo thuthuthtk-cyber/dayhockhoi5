@@ -67,9 +67,11 @@ import { resetOrDeleteStudentAssignmentSubmission } from '../../services/student
 import { syncAssignmentQuestions } from '../../services/assignmentSyncService';
 import { getCurrentTeacherProfile, resolveCurrentTeacherProfile } from '../../services/teacherStorageService';
 import { getStudentsFromLocalStorage, getClassStudentCount, generateDefaultClassRoster } from '../../services/studentStorageService';
-import { auth, db } from '../../services/firebase';
+import { auth, db, ensureFirebaseAuthSessionWithStatus } from '../../services/firebase';
 import { doc, onSnapshot, getDoc, setDoc, collection, getDocs, deleteDoc, runTransaction } from 'firebase/firestore';
-import { trackedSetDoc } from '../../services/firestoreWriteTracker';
+import { trackedSetDoc, extractFirestoreErrorDetails } from '../../services/firestoreWriteTracker';
+import { saveAssignmentToFirestore, syncLocalAssignmentsToFirestoreIfCloudEmpty } from '../../services/assignmentStorageService';
+import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../../utils/firestoreSanitizer';
 import { normalizeStudentCode, formatStandardStudentCode, normalizeStudentName } from '../../services/studentCode';
 import { checkQuestionCorrectLocal } from './StudentExamModule';
 import { useAcademicYear } from '../../contexts/AcademicYearContext';
@@ -259,13 +261,52 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   const [itemsPerPage, setItemsPerPage] = useState<number>(10);
   const [currentPage, setCurrentPage] = useState<number>(1);
 
-  // Toast Notification
+  // Toast Notification & Firestore Sync Error Banner
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const showToast = useCallback((msg: string) => {
+  const [toastType, setToastType] = useState<'success' | 'error'>('success');
+  const [firestoreError, setFirestoreError] = useState<string | null>(null);
+  const [isSyncingCloudAssignments, setIsSyncingCloudAssignments] = useState<boolean>(false);
+  const [isSavingForm, setIsSavingForm] = useState<boolean>(false);
+
+  const showToast = useCallback((msg: string, type?: 'success' | 'error') => {
+    const inferredType: 'success' | 'error' =
+      type || (msg.includes('❌') || msg.includes('⚠️') || msg.includes('Lỗi') || msg.includes('Mã lỗi') || msg.includes('Không thể') ? 'error' : 'success');
+    setToastType(inferredType);
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage(null);
-    }, 3000);
+    }, inferredType === 'error' ? 5500 : 3500);
+  }, []);
+
+  const handleSyncLocalAssignmentsToCloud = useCallback(async (showFeedback = false) => {
+    if (!db) return;
+    setIsSyncingCloudAssignments(true);
+    try {
+      const res = await syncLocalAssignmentsToFirestoreIfCloudEmpty(activeTeacherProfile);
+      if (!res.success && res.error) {
+        setFirestoreError(res.error);
+        if (showFeedback) showToast(res.error, 'error');
+        return;
+      }
+      setFirestoreError(null);
+      if (showFeedback) {
+        if (res.syncedCount > 0) {
+          showToast(`✅ Đã đồng bộ ${res.syncedCount} bài tập lên Cloud Firestore (dayhockhoi5)!`, 'success');
+        } else {
+          showToast('✅ Dữ liệu bài tập trên Cloud Firestore đã được cập nhật!', 'success');
+        }
+      }
+    } catch (err: any) {
+      const details = extractFirestoreErrorDetails(err);
+      setFirestoreError(details.message);
+      if (showFeedback) showToast(details.message, 'error');
+    } finally {
+      setIsSyncingCloudAssignments(false);
+    }
+  }, [activeTeacherProfile, showToast]);
+
+  useEffect(() => {
+    handleSyncLocalAssignmentsToCloud(false).catch(() => {});
   }, []);
 
   // Selected assignment for Detail Modal / Submissions
@@ -1290,10 +1331,18 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     }
 
     try {
+      const authStatus = await ensureFirebaseAuthSessionWithStatus();
+      if (!auth?.currentUser && authStatus.errorCode) {
+        const errMsg = authStatus.errorMessage || 'Chưa xác thực Firebase Auth để ghi Firestore.';
+        setFirestoreError(errMsg);
+        showToast(errMsg, 'error');
+        return;
+      }
+
       const groupList = getGroupAssignments(editingConfigAssignment, assignments);
       const targetDocs = editConfigApplyToGroup && groupList.length > 0 ? groupList : [editingConfigAssignment];
 
-      const patch: any = {
+      const rawPatch: any = {
         startDate: effectiveStartIso,
         assignedDate: effectiveStartIso,
         dueDate: editConfigUnlimited ? '' : effectiveDueIso,
@@ -1308,13 +1357,15 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       };
 
       if (editConfigRealtimeLeaderboard && !editingConfigAssignment.enableRealtimeLeaderboard) {
-        patch.leaderboardEnabledAt = new Date().toISOString();
+        rawPatch.leaderboardEnabledAt = new Date().toISOString();
       }
+      const patch = sanitizeForFirestore(rawPatch);
 
       for (const targetDoc of targetDocs) {
         if (db && targetDoc.id) {
-          const docRef = doc(db, 'assignments', targetDoc.id);
-          await trackedSetDoc(docRef, patch, { merge: true });
+          const safeDocId = sanitizeFirestoreDocId(targetDoc.id, `as-${Date.now()}`);
+          const docRef = doc(db, 'assignments', safeDocId);
+          await trackedSetDoc(docRef, patch, { merge: true }, { isUserInitiated: true, actionType: 'user_action' });
         }
         onSaveAssignment({
           ...targetDoc,
@@ -1322,11 +1373,14 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
         });
       }
 
-      showToast(`✅ Đã cập nhật cài đặt giao bài thành công cho ${targetDocs.length} lớp!`);
+      setFirestoreError(null);
+      showToast(`✅ Đã cập nhật cài đặt giao bài thành công cho ${targetDocs.length} lớp!`, 'success');
       setEditingConfigAssignment(null);
     } catch (err: any) {
-      console.error('Lỗi lưu cài đặt bài tập:', err);
-      showToast(`⚠️ Không thể lưu cài đặt: ${err?.message || String(err)}`);
+      const details = extractFirestoreErrorDetails(err);
+      console.error('Lỗi lưu cài đặt bài tập:', details.message);
+      setFirestoreError(details.message);
+      showToast(`⚠️ Không thể lưu cài đặt: ${details.message}`, 'error');
     }
   };
 
@@ -1341,13 +1395,22 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     const effectiveDueIso = assignUnlimited ? '' : toIsoDateTimeString(assignDueDate);
 
     try {
+      const authStatus = await ensureFirebaseAuthSessionWithStatus();
+      if (!auth?.currentUser && authStatus.errorCode) {
+        const errMsg = authStatus.errorMessage || 'Chưa có phiên xác thực Firebase Auth để ghi dữ liệu.';
+        setFirestoreError(errMsg);
+        setAssignDateError(errMsg);
+        showToast(errMsg, 'error');
+        return;
+      }
+
       const rootId = assigningConfigAssignment.originalAssignmentId || assigningConfigAssignment.id.replace(/-class-.*$/, '');
 
       if (mode === 'update_existing') {
         for (const cls of classesToAssign) {
           const existing = findExistingAssignmentForClass(assigningConfigAssignment, cls);
           if (existing && existing.id) {
-            const patch: any = {
+            const patch = sanitizeForFirestore({
               title: finalTitle,
               startDate: effectiveStartIso,
               assignedDate: effectiveStartIso,
@@ -1359,22 +1422,24 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
               shuffleOptions: assignShuffleOptions,
               enableRealtimeLeaderboard: assignRealtimeLeaderboard,
               updatedAt: new Date().toISOString()
-            };
+            });
             if (db) {
-              await trackedSetDoc(doc(db, 'assignments', existing.id), patch, { merge: true });
+              const safeId = sanitizeFirestoreDocId(existing.id, `as-${Date.now()}`);
+              await trackedSetDoc(doc(db, 'assignments', safeId), patch, { merge: true }, { isUserInitiated: true, actionType: 'user_action' });
             }
             onSaveAssignment({
               ...existing,
               ...patch
             });
           } else {
-            const singleClassId = `${rootId}-class-${cls.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+            const singleClassId = sanitizeFirestoreDocId(`${rootId}-class-${cls.toLowerCase().replace(/[^a-z0-9]/g, '')}`, `as-${Date.now()}`);
             const classRoster = getStudentsFromLocalStorage(cls) || generateDefaultClassRoster(cls, 38);
-            const newDoc: HomeworkAssignment = {
+            const newDoc = sanitizeForFirestore({
               ...assigningConfigAssignment,
               id: singleClassId,
               originalAssignmentId: rootId,
               title: finalTitle,
+              grade: assigningConfigAssignment.grade || 'Khối 5',
               targetClass: cls,
               targetClasses: [cls],
               startDate: effectiveStartIso,
@@ -1388,15 +1453,22 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
               enableRealtimeLeaderboard: assignRealtimeLeaderboard,
               totalStudents: classRoster.length || 38,
               completedCount: 0,
+              questions: Array.isArray(assigningConfigAssignment.questions) ? assigningConfigAssignment.questions : [],
               submissions: []
-            };
-            if (db) {
-              await trackedSetDoc(doc(db, 'assignments', singleClassId), newDoc);
+            }) as HomeworkAssignment;
+            const saveRes = await saveAssignmentToFirestore(newDoc);
+            if (!saveRes.success) {
+              const errMsg = saveRes.error || 'Không thể lưu bài tập lên Cloud Firestore.';
+              setFirestoreError(errMsg);
+              setAssignDateError(errMsg);
+              showToast(errMsg, 'error');
+              return;
             }
             onSaveAssignment(newDoc);
           }
         }
-        showToast(`✅ Đã cập nhật cài đặt bài đã giao cho các lớp (${classesToAssign.join(', ')}) thành công!`);
+        setFirestoreError(null);
+        showToast(`✅ Đã cập nhật cài đặt bài đã giao cho các lớp (${classesToAssign.join(', ')}) thành công!`, 'success');
         confetti({ particleCount: 50, spread: 60, origin: { y: 0.6 } });
         setAssigningConfigAssignment(null);
         setConflictAssignData(null);
@@ -1413,13 +1485,14 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       }
 
       for (const cls of classesToAssign) {
-        const singleClassId = `${newRoundBaseId}-class-${cls.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+        const singleClassId = sanitizeFirestoreDocId(`${newRoundBaseId}-class-${cls.toLowerCase().replace(/[^a-z0-9]/g, '')}`, `as-${Date.now()}`);
         const classRoster = getStudentsFromLocalStorage(cls) || generateDefaultClassRoster(cls, 38);
-        const newAssignmentDoc: HomeworkAssignment = {
+        const newAssignmentDoc = sanitizeForFirestore({
           ...assigningConfigAssignment,
           id: singleClassId,
           originalAssignmentId: newRoundBaseId,
           title: assignTitleResolved,
+          grade: assigningConfigAssignment.grade || 'Khối 5',
           targetClass: cls,
           targetClasses: [cls],
           startDate: effectiveStartIso,
@@ -1433,22 +1506,31 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
           enableRealtimeLeaderboard: assignRealtimeLeaderboard,
           totalStudents: classRoster.length || 38,
           completedCount: 0,
+          questions: Array.isArray(assigningConfigAssignment.questions) ? assigningConfigAssignment.questions : [],
           submissions: []
-        };
-        if (db) {
-          await trackedSetDoc(doc(db, 'assignments', singleClassId), newAssignmentDoc);
+        }) as HomeworkAssignment;
+        const saveRes = await saveAssignmentToFirestore(newAssignmentDoc);
+        if (!saveRes.success) {
+          const errMsg = saveRes.error || 'Không thể lưu giao bài tập lên Cloud Firestore.';
+          setFirestoreError(errMsg);
+          setAssignDateError(errMsg);
+          showToast(errMsg, 'error');
+          return;
         }
         onSaveAssignment(newAssignmentDoc);
       }
 
+      setFirestoreError(null);
       confetti({ particleCount: 60, spread: 70, origin: { y: 0.6 } });
-      showToast(`🚀 Đã giao bài tập thành công cho các lớp (${classesToAssign.join(', ')})!`);
-    } catch (err: any) {
-      console.error('Lỗi khi giao bài tập:', err);
-      showToast(`⚠️ Không thể lưu giao bài tập lên máy chủ: ${err?.message || String(err)}`);
-    } finally {
+      showToast(`🚀 Đã giao bài tập thành công lên Firestore cho các lớp (${classesToAssign.join(', ')})!`, 'success');
       setAssigningConfigAssignment(null);
       setConflictAssignData(null);
+    } catch (err: any) {
+      const details = extractFirestoreErrorDetails(err);
+      console.error('Lỗi khi giao bài tập:', details.message);
+      setFirestoreError(details.message);
+      setAssignDateError(details.message);
+      showToast(`⚠️ Không thể lưu giao bài tập lên máy chủ: ${details.message}`, 'error');
     }
   };
 
@@ -1538,7 +1620,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     return sharedAssignmentIds.includes(as.id) || (as as any).isShared === true;
   };
 
-  const handleConfirmShare = (as: HomeworkAssignment) => {
+  const handleConfirmShare = async (as: HomeworkAssignment) => {
     const updatedSharedIds = Array.from(new Set([...sharedAssignmentIds, as.id]));
     setSharedAssignmentIds(updatedSharedIds);
     try {
@@ -1547,23 +1629,31 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       console.error(e);
     }
 
-    const updatedAssignment: HomeworkAssignment = {
+    const updatedAssignment = sanitizeForFirestore({
       ...as,
       isShared: true
-    } as HomeworkAssignment;
+    }) as HomeworkAssignment;
 
+    const res = await saveAssignmentToFirestore(updatedAssignment);
     onSaveAssignment(updatedAssignment);
-    showToast('✅ Đã chia sẻ bài tập thành công vào kho Học liệu của đồng nghiệp!');
+    if (!res.success) {
+      setFirestoreError(res.error || 'Lỗi chia sẻ bài tập lên Firestore.');
+      showToast(res.error || '⚠️ Không thể đồng bộ chia sẻ lên Firestore.', 'error');
+    } else {
+      setFirestoreError(null);
+      showToast('✅ Đã chia sẻ bài tập thành công vào kho Học liệu của đồng nghiệp!', 'success');
+    }
     setSharingAssignment(null);
   };
 
-  const handleCopyAndAssign = (as: HomeworkAssignment) => {
+  const handleCopyAndAssign = async (as: HomeworkAssignment) => {
     const nowIso = toIsoDateTimeString(new Date());
     const copiedIsUnlimited = as.isUnlimited ?? isUnlimitedDeadline(as.dueDate);
-    const copiedAssignment: HomeworkAssignment = {
+    const copiedAssignment = sanitizeForFirestore({
       ...as,
       id: `as-copy-${Date.now()}`,
       title: `${as.title} (Bản sao giao cho lớp)`,
+      grade: as.grade || 'Khối 5',
       targetClass: 'Lớp 5C',
       authorType: 'my',
       teacherId: activeTeacherProfile.id,
@@ -1574,10 +1664,18 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       assignedDate: nowIso,
       dueDate: copiedIsUnlimited ? '' : (toIsoDateTimeString(as.dueDate) || ''),
       isUnlimited: copiedIsUnlimited,
+      questions: Array.isArray(as.questions) ? as.questions : [],
       submissions: []
-    };
+    }) as HomeworkAssignment;
+    const res = await saveAssignmentToFirestore(copiedAssignment);
     onSaveAssignment(copiedAssignment);
-    showToast(`✅ Đã sao chép & giao bài tập "${as.title}" cho Lớp 5C thành công!`);
+    if (!res.success) {
+      setFirestoreError(res.error || 'Lỗi lưu bài tập sao chép lên Firestore.');
+      showToast(res.error || '⚠️ Không thể lưu bài tập lên Cloud Firestore.', 'error');
+    } else {
+      setFirestoreError(null);
+      showToast(`✅ Đã sao chép & giao bài tập "${as.title}" cho Lớp 5C lên Firestore thành công!`, 'success');
+    }
   };
 
   useEffect(() => {
@@ -1787,7 +1885,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   const [isBankAssignmentModalOpen, setIsBankAssignmentModalOpen] = useState(false);
   const [isBankSelectModalOpen, setIsBankSelectModalOpen] = useState(false);
 
-  const handleAssignFromBank = (config: {
+  const handleAssignFromBank = async (config: {
     title: string;
     subject: string;
     grade: string;
@@ -1804,7 +1902,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     const rootId = `hw-bank-${Date.now()}`;
     const rawClasses = config.classes && config.classes.length > 0 ? config.classes : [];
     if (rawClasses.length === 0) {
-      showToast('⚠️ Vui lòng chọn ít nhất một lớp để giao bài!');
+      showToast('⚠️ Vui lòng chọn ít nhất một lớp để giao bài!', 'error');
       return;
     }
     const classes = Array.from(new Set(rawClasses.map(c => c.trim()).filter(Boolean)));
@@ -1812,22 +1910,26 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     const startIso = config.startDate ? (toIsoDateTimeString(config.startDate) || nowIso) : nowIso;
     const isUnlim = Boolean(config.isUnlimited || isUnlimitedDeadline(config.dueDate));
     const dueIso = isUnlim ? '' : toIsoDateTimeString(config.dueDate);
+    const sanitizedSelectedQuestions = (config.selectedQuestions || []).map((q) =>
+      sanitizeForFirestore(sanitizeQuestionForFirestore(q))
+    );
 
-    classes.forEach((cls) => {
+    let firstWriteError: string | null = null;
+    for (const cls of classes) {
       const classRoster = getStudentsFromLocalStorage(cls) || generateDefaultClassRoster(cls, 38);
       const realTotal = classRoster && classRoster.length > 0 ? classRoster.length : (cls.includes('5C') ? 38 : 35);
 
-      const newAssignment: HomeworkAssignment = {
+      const newAssignment = sanitizeForFirestore({
         id: classes.length === 1 ? rootId : `${rootId}-class-${cls.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
         title: config.title || `Bài tập rèn luyện môn ${config.subject} (${formatDateTimeVN(new Date(), '')})`,
         subject: config.subject,
-        grade: config.grade,
+        grade: config.grade || 'Khối 5',
         targetClass: cls,
         startDate: startIso,
         dueDate: dueIso,
         isUnlimited: isUnlim,
-        description: `Bài tập tự luyện từ Ngân hàng câu hỏi gồm ${config.selectedQuestions.length} câu hỏi chuẩn sư phạm.`,
-        questions: config.selectedQuestions,
+        description: `Bài tập tự luyện từ Ngân hàng câu hỏi gồm ${sanitizedSelectedQuestions.length} câu hỏi chuẩn sư phạm.`,
+        questions: sanitizedSelectedQuestions,
         teacherId: activeTeacherProfile.id,
         teacherName: activeTeacherProfile.name,
         teacherEmail: activeTeacherProfile.email,
@@ -1842,15 +1944,27 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
         completedCount: 0,
         submissions: [],
         createdAt: new Date().toISOString()
-      };
-      onSaveAssignment(newAssignment);
-    });
+      }) as HomeworkAssignment;
 
-    showToast(
-      classes.length > 1
-        ? `✅ Đã giao bài tập thành công cho ${classes.length} lớp riêng biệt (${classes.join(', ')})!`
-        : `✅ Đã giao bài tập "${config.title || 'từ Ngân hàng'}" thành công!`
-    );
+      const res = await saveAssignmentToFirestore(newAssignment);
+      if (!res.success && !firstWriteError) {
+        firstWriteError = res.error || 'Không thể lưu bài tập lên Cloud Firestore.';
+      }
+      onSaveAssignment(newAssignment);
+    }
+
+    if (firstWriteError) {
+      setFirestoreError(firstWriteError);
+      showToast(`❌ Lỗi ghi bài tập lên Firestore: ${firstWriteError}`, 'error');
+    } else {
+      setFirestoreError(null);
+      showToast(
+        classes.length > 1
+          ? `✅ Đã giao & lưu bài tập lên Cloud Firestore cho ${classes.length} lớp (${classes.join(', ')})!`
+          : `✅ Đã giao & lưu bài tập "${config.title || 'từ Ngân hàng'}" lên Cloud Firestore thành công!`,
+        'success'
+      );
+    }
     setIsBankAssignmentModalOpen(false);
   };
 
@@ -1995,7 +2109,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   const paginatedAssignments = filteredAssignments.slice(startIndex, startIndex + itemsPerPage);
 
   // Create Assignment handler
-  const handleSaveForm = () => {
+  const handleSaveForm = async () => {
     setFormDateError(null);
     if (!formTitle.trim()) {
       setFormDateError('Vui lòng nhập tiêu đề bài tập!');
@@ -2023,40 +2137,68 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       dueIso = toIsoDateTimeString(dueObj);
     }
 
-    const sanitizedQuestions = (formQuestions || []).map(q => sanitizeQuestionForFirestore(q));
+    setIsSavingForm(true);
+    try {
+      const sanitizedQuestions = (formQuestions || []).map(q =>
+        sanitizeForFirestore(sanitizeQuestionForFirestore(q))
+      );
 
-    const classRoster = getStudentsFromLocalStorage(formTargetClass) || generateDefaultClassRoster(formTargetClass, 38);
-    const realTotal = classRoster && classRoster.length > 0 ? classRoster.length : (formTargetClass.includes('5C') ? 38 : (editingAssignment?.totalStudents || 38));
+      const classRoster = getStudentsFromLocalStorage(formTargetClass) || generateDefaultClassRoster(formTargetClass, 38);
+      const realTotal = classRoster && classRoster.length > 0 ? classRoster.length : (formTargetClass.includes('5C') ? 38 : (editingAssignment?.totalStudents || 38));
 
-    const assignmentToSave: HomeworkAssignment = {
-      id: editingAssignment ? editingAssignment.id : `as-${Date.now()}`,
-      title: formTitle,
-      subject: formSubject,
-      grade: formGrade,
-      targetClass: formTargetClass,
-      teacherId: editingAssignment?.teacherId || activeTeacherProfile.id,
-      teacherName: editingAssignment?.teacherName || formTeacherName || activeTeacherProfile.name,
-      teacherEmail: activeTeacherProfile.email,
-      createdBy: editingAssignment?.createdBy || activeTeacherProfile.id,
-      startDate: startIso,
-      assignedDate: toIsoDateTimeString(parseFirestoreDate(editingAssignment?.assignedDate) || startObj),
-      dueDate: formIsUnlimited ? '' : dueIso,
-      isUnlimited: formIsUnlimited,
-      description: formDescription,
-      totalStudents: realTotal,
-      completedCount: editingAssignment?.completedCount || 0,
-      isApproved: true,
-      authorType: 'my',
-      createdAt: editingAssignment?.createdAt || new Date().toISOString(),
-      questions: sanitizedQuestions,
-      submissions: editingAssignment ? editingAssignment.submissions : []
-    };
+      const assignmentToSave = sanitizeForFirestore({
+        id: editingAssignment ? editingAssignment.id : `as-${Date.now()}`,
+        title: formTitle.trim(),
+        subject: formSubject,
+        grade: formGrade || 'Khối 5',
+        targetClass: formTargetClass,
+        teacherId: editingAssignment?.teacherId || activeTeacherProfile.id,
+        teacherName: editingAssignment?.teacherName || formTeacherName || activeTeacherProfile.name,
+        teacherEmail: activeTeacherProfile.email || '',
+        createdBy: editingAssignment?.createdBy || activeTeacherProfile.id,
+        startDate: startIso,
+        assignedDate: toIsoDateTimeString(parseFirestoreDate(editingAssignment?.assignedDate) || startObj),
+        dueDate: formIsUnlimited ? '' : dueIso,
+        isUnlimited: formIsUnlimited,
+        description: formDescription || '',
+        totalStudents: realTotal,
+        completedCount: editingAssignment?.completedCount || 0,
+        isApproved: true,
+        authorType: 'my',
+        createdAt: editingAssignment?.createdAt || new Date().toISOString(),
+        questions: sanitizedQuestions,
+        submissions: Array.isArray(editingAssignment?.submissions) ? editingAssignment.submissions : []
+      }) as HomeworkAssignment;
 
-    onSaveAssignment(assignmentToSave);
-    setIsCreatingModalOpen(false);
-    setEditingAssignment(null);
-    resetForm();
-    showToast(editingAssignment ? 'Cập nhật bài tập thành công!' : 'Tạo bài tập mới thành công!');
+      const saveRes = await saveAssignmentToFirestore(assignmentToSave);
+      onSaveAssignment(assignmentToSave);
+
+      if (!saveRes.success) {
+        const errMsg = saveRes.error || 'Không thể lưu bài tập lên Cloud Firestore.';
+        setFormDateError(errMsg);
+        setFirestoreError(errMsg);
+        showToast(errMsg, 'error');
+        return;
+      }
+
+      setFirestoreError(null);
+      setIsCreatingModalOpen(false);
+      setEditingAssignment(null);
+      resetForm();
+      showToast(
+        editingAssignment
+          ? '✅ Đã cập nhật & đồng bộ bài tập lên Cloud Firestore!'
+          : '✅ Đã tạo & lưu bài tập mới lên Cloud Firestore thành công!',
+        'success'
+      );
+    } catch (err: any) {
+      const details = extractFirestoreErrorDetails(err);
+      setFormDateError(details.message);
+      setFirestoreError(details.message);
+      showToast(details.message, 'error');
+    } finally {
+      setIsSavingForm(false);
+    }
   };
 
   const resetForm = () => {
@@ -2184,9 +2326,51 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     <div className="space-y-6 text-slate-800">
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed top-5 right-5 z-50 bg-slate-900 text-white text-xs font-bold px-4 py-3 rounded-xl shadow-xl flex items-center gap-2 border border-slate-700 animate-fade-in">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+        <div
+          className={`fixed top-5 right-5 z-50 text-white text-xs font-bold px-4 py-3 rounded-xl shadow-xl flex items-center gap-2 border animate-fade-in max-w-md ${
+            toastType === 'error'
+              ? 'bg-rose-600 border-rose-400'
+              : 'bg-slate-900 border-slate-700'
+          }`}
+        >
+          {toastType === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-white shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          )}
           <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {firestoreError && (
+        <div className="bg-rose-50 border border-rose-200 text-rose-800 px-4 py-3 rounded-2xl flex items-start justify-between gap-3 shadow-xs">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="text-xs font-extrabold text-rose-900">
+                Lỗi ghi / đồng bộ Bài tập lên Cloud Firestore (dayhockhoi5)
+              </p>
+              <p className="text-xs font-medium text-rose-700">{firestoreError}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={isSyncingCloudAssignments}
+              onClick={() => handleSyncLocalAssignmentsToCloud(true)}
+              className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold cursor-pointer disabled:opacity-50"
+            >
+              {isSyncingCloudAssignments ? 'Đang thử...' : 'Thử đồng bộ lại'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setFirestoreError(null)}
+              className="p-1 text-rose-500 hover:text-rose-700 cursor-pointer"
+              aria-label="Đóng thông báo lỗi"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -3760,10 +3944,12 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                 Hủy bỏ
               </button>
               <button
+                type="button"
+                disabled={isSavingForm}
                 onClick={handleSaveForm}
-                className="px-6 py-2.5 rounded-xl text-xs font-black bg-indigo-900 hover:bg-indigo-950 text-white shadow-lg cursor-pointer transition-all flex items-center gap-2"
+                className="px-6 py-2.5 rounded-xl text-xs font-black bg-indigo-900 hover:bg-indigo-950 disabled:opacity-60 text-white shadow-lg cursor-pointer transition-all flex items-center gap-2"
               >
-                <span>💾 Lưu toàn bộ & Đóng</span>
+                <span>{isSavingForm ? '⏳ Đang lưu lên Firestore...' : '💾 Lưu toàn bộ & Đóng'}</span>
               </button>
             </div>
           </div>

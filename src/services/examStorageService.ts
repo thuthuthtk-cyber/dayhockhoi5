@@ -1,11 +1,12 @@
-import { db, isFirestoreQuotaExceeded, markFirestoreQuotaExceeded } from './firebase';
-import { collection, doc, getDocs, onSnapshot } from 'firebase/firestore';
+import { db, ensureFirebaseAuthSession, isFirestoreQuotaExceeded, markFirestoreQuotaExceeded } from './firebase';
+import { collection, doc, getDocs, onSnapshot, query, where, Query } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch, extractFirestoreErrorDetails } from './firestoreWriteTracker';
 import { ExamPaper } from '../types';
 import { INITIAL_EXAMS } from './mockData';
 import { removeUndefined } from './teacherStorageService';
 import { waitForWriteConfirmation, updateCollectionCacheStatus } from './firestoreWriteVerificationService';
 import { normalizeClassKey } from './studentStorageService';
+import { isAdmin, getAllAccessibleClasses, canManageClass, UserPermissionsProfile } from '../utils/permissions';
 
 const EXAMS_CACHE_KEY = 'eduplay_k5_cached_exams';
 
@@ -208,6 +209,8 @@ export async function saveExamToFirestore(exam: ExamPaper): Promise<void> {
       return;
     }
 
+    await ensureFirebaseAuthSession();
+
     const examRef = doc(db, 'exams', exam.id);
     const { submissionsCount, completedCount, ...examPayloadToSave } = exam as any;
     const cleanedPayload = removeUndefined({
@@ -248,30 +251,59 @@ export async function saveExamToFirestore(exam: ExamPaper): Promise<void> {
   }
 }
 
+function buildExamsQueryForUser(userProfile?: UserPermissionsProfile | null): Query | ReturnType<typeof collection> {
+  const baseCol = collection(db, 'exams');
+  if (!userProfile || isAdmin(userProfile)) {
+    return baseCol;
+  }
+  const accessible = getAllAccessibleClasses(userProfile);
+  const classVariants = Array.from(
+    new Set(
+      accessible.flatMap((c) => [c, `Lớp ${c}`]).filter(Boolean)
+    )
+  ).slice(0, 30);
+
+  if (classVariants.length > 0) {
+    return query(baseCol, where('targetClass', 'in', classVariants));
+  }
+  if (userProfile.email) {
+    return query(baseCol, where('teacherEmail', '==', userProfile.email.trim().toLowerCase()));
+  }
+  return query(baseCol, where('grade', '==', 'Khối 5'));
+}
+
 /**
- * Lấy toàn bộ danh sách Đề kiểm tra chính thức từ Firestore
+ * Lấy danh sách Đề kiểm tra chính thức từ Firestore (Admin: toàn quyền; Teacher: lọc theo permissions.ts & where())
  */
-export async function getExamsFromFirestore(): Promise<ExamPaper[]> {
+export async function getExamsFromFirestore(userProfile?: UserPermissionsProfile | null): Promise<ExamPaper[]> {
   try {
     if (!db) return getLocalCachedExams();
 
-    const examsSnap = await getDocs(collection(db, 'exams'));
+    await ensureFirebaseAuthSession();
+    const qRef = buildExamsQueryForUser(userProfile);
+    const examsSnap = await getDocs(qRef);
     if (!examsSnap.empty) {
       const exams: ExamPaper[] = [];
       examsSnap.forEach(docSnap => {
-        const data = docSnap.data();
+        const data = docSnap.data() as any;
         const examObj = { id: docSnap.id, ...data } as ExamPaper;
-        if (isValidOfficialExam(examObj)) {
+        if (
+          isValidOfficialExam(examObj) &&
+          (!userProfile || isAdmin(userProfile) || canManageClass(userProfile, examObj.targetClass) || !examObj.targetClass)
+        ) {
           exams.push(examObj);
         }
       });
       const clean = deduplicateExams(exams);
-      saveExamsToLocalStorage(clean);
+      if (!userProfile || isAdmin(userProfile)) {
+        saveExamsToLocalStorage(clean);
+      }
       return clean;
     }
 
-    // Nếu rỗng, không gieo mầm dữ liệu mẫu
-    saveExamsToLocalStorage([]);
+    if (!userProfile || isAdmin(userProfile)) {
+      saveExamsToLocalStorage([]);
+    }
     return [];
   } catch (error) {
     console.warn("Lỗi đọc danh sách đề thi từ Firestore:", error);
@@ -284,7 +316,8 @@ export async function getExamsFromFirestore(): Promise<ExamPaper[]> {
  */
 export function subscribeToExamsFromFirestore(
   onUpdate: (exams: ExamPaper[]) => void,
-  onError?: (err: any) => void
+  onError?: (err: any) => void,
+  userProfile?: UserPermissionsProfile | null
 ) {
   if (!db || isFirestoreQuotaExceeded()) {
     onUpdate(getLocalCachedExams());
@@ -292,7 +325,7 @@ export function subscribeToExamsFromFirestore(
   }
 
   try {
-    const examsColRef = collection(db, 'exams');
+    const examsColRef = buildExamsQueryForUser(userProfile);
     return onSnapshot(
       examsColRef,
       (snapshot) => {
@@ -304,18 +337,25 @@ export function subscribeToExamsFromFirestore(
         if (!snapshot.empty) {
           const loadedExams: ExamPaper[] = [];
           snapshot.forEach((docSnap) => {
-            const data = docSnap.data();
+            const data = docSnap.data() as any;
             const examObj = { id: docSnap.id, ...data } as ExamPaper;
-            if (isValidOfficialExam(examObj)) {
+            if (
+              isValidOfficialExam(examObj) &&
+              (!userProfile || isAdmin(userProfile) || canManageClass(userProfile, examObj.targetClass) || !examObj.targetClass)
+            ) {
               loadedExams.push(examObj);
             }
           });
           const cleanLoaded = deduplicateExams(loadedExams);
           cleanLoaded.sort((a, b) => (b.id > a.id ? 1 : -1));
-          saveExamsToLocalStorage(cleanLoaded);
+          if (!userProfile || isAdmin(userProfile)) {
+            saveExamsToLocalStorage(cleanLoaded);
+          }
           onUpdate(cleanLoaded);
         } else {
-          saveExamsToLocalStorage([]);
+          if (!userProfile || isAdmin(userProfile)) {
+            saveExamsToLocalStorage([]);
+          }
           onUpdate([]);
         }
       },

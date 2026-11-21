@@ -258,7 +258,11 @@ export function extractFirestoreErrorDetails(err: any): { code: string; message:
   if (code === 'resource-exhausted' || rawMessage.includes('resource-exhausted') || rawMessage.includes('quota')) {
     message = 'Mã lỗi [resource-exhausted]: Đã vượt quá hạn mức ghi dữ liệu của Firestore trong ngày (Free Tier ~20.000 writes/ngày).';
   } else if (code === 'permission-denied' || rawMessage.includes('permission-denied')) {
-    message = 'Mã lỗi [permission-denied]: Bị từ chối quyền truy cập hoặc ghi dữ liệu Firestore (kiểm tra Rules).';
+    message = 'Mã lỗi [permission-denied]: Bị từ chối quyền truy cập hoặc ghi dữ liệu Firestore (kiểm tra Rules / đăng nhập Authentication).';
+  } else if (code === 'invalid-argument' || rawMessage.includes('invalid-argument') || rawMessage.includes('Unsupported field value: undefined')) {
+    message = `Mã lỗi [invalid-argument]: Dữ liệu gửi lên Firestore không hợp lệ (${rawMessage}).`;
+  } else if (String(code).startsWith('auth/')) {
+    message = `Mã lỗi [${code}]: Lỗi xác thực Firebase Auth (${rawMessage}).`;
   } else if (code === 'unavailable' || rawMessage.includes('unavailable')) {
     message = 'Mã lỗi [unavailable]: Dịch vụ Firestore tạm thời không phản hồi hoặc gián đoạn mạng.';
   } else if (rawMessage.includes('timeout') || code === 'deadline-exceeded') {
