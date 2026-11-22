@@ -73,40 +73,53 @@ export function deduplicateAndNormalizeStudents(
   if (!Array.isArray(students)) return [];
 
   const stdName = getStandardClassName(className);
-  const key = normalizeClassKey(stdName);
-  const seenIds = new Set<string>();
+  const key = normalizeClassKey(stdName); // e.g. "5C"
   const seenCodes = new Set<string>();
   const uniqueStudents: StudentRecord[] = [];
 
   students.forEach((st) => {
     if (!st || typeof st !== 'object') return;
+    const rawName = (st.name || st.fullName || '').trim();
+    if (!rawName) return;
+
+    const rawCode = normalizeStudentCode(st.studentCode || st.code || '');
     
-    const rawId = (st.id || '').trim();
-    const rawCode = (st.code || st.username || '').trim().toLowerCase();
+    // Filter out stray students belonging to a different class prefix if code explicitly indicates another class
+    if (rawCode) {
+      const classPrefixMatch = rawCode.match(/^([A-Z0-9]+)\d{2}-\d{2}-\d+$/);
+      if (classPrefixMatch && classPrefixMatch[1] && classPrefixMatch[1] !== key) {
+        return;
+      }
+      // Drop stray high-index test codes like 100+ if class size is normal (< 60)
+      const indexMatch = rawCode.match(/(\d+)$/);
+      if (indexMatch && indexMatch[1]) {
+        const num = parseInt(indexMatch[1], 10);
+        if (!isNaN(num) && num > 60 && !String(st.id || '').includes(key.toLowerCase())) {
+          return;
+        }
+      }
+    }
 
-    // If duplicate raw ID or code exists in the incoming array, skip duplicate row
-    if (rawId && seenIds.has(rawId)) {
+    const dedupKey = rawCode || rawName.toLowerCase();
+    if (seenCodes.has(dedupKey)) {
       return;
     }
-    if (rawCode && seenCodes.has(rawCode)) {
-      return;
-    }
-
-    if (rawId) seenIds.add(rawId);
-    if (rawCode) seenCodes.add(rawCode);
+    seenCodes.add(dedupKey);
     uniqueStudents.push(st);
   });
 
   const finalSeenIds = new Set<string>();
   return uniqueStudents.map((st, idx) => {
     const stt = idx + 1;
-    const rawStdCode = formatStandardStudentCode(st.code || (st as any).studentCode, key, stt);
-    const code = normalizeStudentCode(rawStdCode);
+    const existingCode = normalizeStudentCode(st.studentCode || st.code);
+    const code = existingCode && existingCode.startsWith(key)
+      ? existingCode
+      : formatStandardStudentCode(existingCode || `${key}26-27-${stt}`, key, stt);
     
     // Ensure every record has a unique ID and no collisions
-    let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${key}-${stt}`;
+    let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${key.toLowerCase()}-${stt}`;
     if (finalSeenIds.has(id)) {
-      id = `st-${key}-${stt}-${idx + 1}`;
+      id = `st-${key.toLowerCase()}-${stt}-${idx + 1}`;
     }
     finalSeenIds.add(id);
 
@@ -868,24 +881,29 @@ export async function syncClassStudentsToFirestore(
       };
     }
 
-    const stdName = getStandardClassName(className);
-    const classKey = normalizeClassKey(className);
-    if (/^5[AB]\d*$/i.test(classKey)) {
-      return { success: false, error: 'Lớp 5A/5B không còn được sử dụng trong hệ thống Khối 5.', code: 'invalid-argument' };
+    const cleanInputClass = (className || '').trim() || '5C';
+    const stdName = getStandardClassName(cleanInputClass);
+    const classKey = normalizeClassKey(cleanInputClass);
+    if (!classKey || /^5[AB]\d*$/i.test(classKey)) {
+      return { success: false, error: 'Lớp học không hợp lệ hoặc không thuộc Khối 5.', code: 'invalid-argument' };
     }
 
-    const safeClassKey = sanitizeFirestoreDocId(classKey, '5C');
+    const safeClassKey = sanitizeFirestoreDocId(classKey, classKey);
     const gradeDigit = stdName.replace(/[^0-9]/g, '') || '5';
     const normalizedGrade = `Khối ${gradeDigit}`;
     const nowIso = new Date().toISOString();
 
     const cleanedRaw = deduplicateAndNormalizeStudents(students, stdName);
     const cleaned = cleanedRaw.map((s, idx) => {
-      const normCode = normalizeStudentCode(s.studentCode || s.code || `${classKey}26-27-${idx + 1}`);
+      const currentStt = s.stt && s.stt > 0 ? s.stt : (idx + 1);
+      const existingCode = s.studentCode || s.code;
+      const standardizedCode = formatStandardStudentCode(existingCode, classKey, currentStt);
+      const normCode = normalizeStudentCode(standardizedCode);
+
       return sanitizeForFirestore({
         ...s,
-        id: s.id || `st-${classKey.toLowerCase()}-${idx + 1}`,
-        stt: s.stt || idx + 1,
+        id: s.id || `st-${classKey.toLowerCase()}-${currentStt}`,
+        stt: currentStt,
         code: normCode,
         studentCode: normCode,
         username: normalizeStudentCode(s.username || normCode),
@@ -901,7 +919,7 @@ export async function syncClassStudentsToFirestore(
     const maleCount = cleaned.filter((s) => s.gender === 'Nam').length;
     const femaleCount = cleaned.filter((s) => s.gender === 'Nữ').length;
 
-    // 1. Save full roster document in 'class_rosters' collection
+    // 1. Save full roster document in 'class_rosters' collection using exact classKey (e.g. 5C, 5D)
     const rosterRef = doc(db, 'class_rosters', safeClassKey);
     const rosterPayload = sanitizeForFirestore({
       className: stdName,
