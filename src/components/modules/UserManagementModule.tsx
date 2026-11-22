@@ -1823,7 +1823,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
   // Helper to get stats for a class dynamically from studentDatabase with fallback
   const getClassStats = (className: string) => {
-    if (!hasYearEnrollments) {
+    if (!hasYearEnrollments && selectedAcademicYear !== '2026-2027') {
       return { total: 0, male: 0, female: 0 };
     }
 
@@ -1864,7 +1864,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
   // Helper to get stats for a block dynamically from studentDatabase
   const getBlockStats = (gradeInput: string) => {
-    if (!hasYearEnrollments) {
+    if (!hasYearEnrollments && selectedAcademicYear !== '2026-2027') {
       return { total: 0, male: 0, female: 0 };
     }
 
@@ -2120,19 +2120,24 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   }, [canManageStudentsInClass, selectedClass]);
 
   // Direct class list without intermediate block card
-  const activeBlockClasses = hasYearEnrollments ? classesList.filter(isGrade5Class) : [];
+  const activeBlockClasses = (hasYearEnrollments || selectedAcademicYear === '2026-2027') ? classesList.filter(isGrade5Class) : [];
   const activeBlockDynamicStats = getBlockStats('Khối 5');
 
   // Compute total dynamic stats for selected class
   const currentClassStudents = useMemo(() => {
-    if (!selectedClass || !hasYearEnrollments) return [];
+    if (!selectedClass) return [];
     if (selectedAcademicYear === '2026-2027') {
-      return (
-        studentDatabase[selectedClass] ||
-        studentDatabase[getStandardClassName(selectedClass)] ||
-        studentDatabase[normalizeClassKey(selectedClass)] ||
-        []
-      );
+      const stdName = getStandardClassName(selectedClass);
+      const key = normalizeClassKey(selectedClass);
+      const list =
+        (studentDatabase[selectedClass] && studentDatabase[selectedClass].length > 0 ? studentDatabase[selectedClass] : null) ||
+        (studentDatabase[stdName] && studentDatabase[stdName].length > 0 ? studentDatabase[stdName] : null) ||
+        (studentDatabase[key] && studentDatabase[key].length > 0 ? studentDatabase[key] : null) ||
+        getStudentsFromLocalStorage(stdName) ||
+        getStudentsFromLocalStorage(key) ||
+        getStudentsFromLocalStorage(selectedClass) ||
+        [];
+      return deduplicateAndNormalizeStudents(list, stdName);
     }
     const enrollments = getStudentEnrollmentsForYear(selectedAcademicYear);
     const classStd = getStandardClassName(selectedClass);
@@ -2409,7 +2414,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
               </div>
 
               {/* Class Cards Grid */}
-              {!hasYearEnrollments ? (
+              {!hasYearEnrollments && selectedAcademicYear !== '2026-2027' ? (
                 <AcademicYearEmptyState
                   academicYear={selectedAcademicYear}
                   onGoToPromotion={() => setMainTab('promotion')}
@@ -2689,7 +2694,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                   </div>
 
                   {/* Student Roster Table */}
-                  {!hasYearEnrollments ? (
+                  {!hasYearEnrollments && selectedAcademicYear !== '2026-2027' ? (
                     <AcademicYearEmptyState
                       academicYear={selectedAcademicYear}
                       title={`Chưa có học sinh nào của ${selectedClass} trong năm học ${selectedAcademicYear}`}

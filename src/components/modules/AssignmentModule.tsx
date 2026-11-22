@@ -702,7 +702,14 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     const subList: any[] = [
       ...(Array.isArray(detailAssignment.submissions) ? detailAssignment.submissions : []),
       ...liveSubmissions
-    ];
+    ].filter(sub => {
+      if (!sub) return false;
+      const assignId = sub.assignmentId || sub.assignment?.id || sub.id;
+      if (assignId && detailAssignment.id && assignId !== detailAssignment.id && !detailAssignment.id.includes(assignId) && !assignId.includes(detailAssignment.id)) {
+        return false;
+      }
+      return true;
+    });
     const subMap = new Map<string, any>();
 
     const indexSubmission = (sub: any) => {
@@ -714,50 +721,29 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
         sub.code,
         sub.username,
         sub.userId,
-        sub.id,
-        sub.studentName,
-        sub.name,
-        sub.fullName
+        sub.id
       ];
 
       candidates.forEach(cand => {
         if (cand && typeof cand === 'string') {
-          const raw = cand.trim().toLowerCase();
-          if (raw) {
-            subMap.set(raw, sub);
-            // Normalized key (remove "st-", "hs-", "user-", accents/dashes/spaces)
-            const clean = raw.replace(/^(st|hs|user|u)[\-_]?/i, '').replace(/[\s\-_]/g, '');
-            if (clean) subMap.set(clean, sub);
-
-            const stdCode = normalizeStudentCode(cand);
-            if (stdCode) {
-              subMap.set(stdCode, sub);
-              subMap.set(stdCode.toLowerCase(), sub);
-              const cleanStd = stdCode.toLowerCase().replace(/[\s\-_]/g, '');
-              if (cleanStd) subMap.set(cleanStd, sub);
-            }
-
-            const formatted = formatStandardStudentCode(cand, targetClassName);
-            if (formatted) {
-              subMap.set(formatted, sub);
-              subMap.set(formatted.toLowerCase(), sub);
-            }
+          const stdCode = normalizeStudentCode(cand);
+          if (stdCode) {
+            subMap.set(stdCode, sub);
+            subMap.set(stdCode.toLowerCase(), sub);
+          }
+          const clean = cand.trim().toUpperCase();
+          if (clean) {
+            subMap.set(clean, sub);
+            subMap.set(clean.toLowerCase(), sub);
           }
         }
       });
-
-      const sName = sub.studentName || sub.name || sub.fullName;
-      if (sName && typeof sName === 'string') {
-        const normName = normalizeStudentName(sName);
-        if (normName) subMap.set(normName, sub);
-        subMap.set(sName.trim().toLowerCase(), sub);
-      }
     };
 
     // Index all existing submissions on detailAssignment and liveSubmissions
     subList.forEach(sub => indexSubmission(sub));
 
-    // Also scan localStorage for submissions of each student in this class
+    // Also scan localStorage for submissions of each student in this class (strictly matching assignmentId)
     if (typeof window !== 'undefined') {
       classStudentsRoster.forEach(st => {
         const storageKeysToCheck = [
@@ -774,15 +760,14 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
             if (raw) {
               const parsed = JSON.parse(raw);
               if (Array.isArray(parsed)) {
-                const matched = parsed.find((item: any) => 
-                  item.assignment?.id === detailAssignment.id ||
-                  item.id === detailAssignment.id ||
-                  item.assignmentId === detailAssignment.id ||
-                  (item.title && item.title === detailAssignment.title)
-                );
+                const matched = parsed.find((item: any) => {
+                  const aid = item.assignment?.id || item.id || item.assignmentId;
+                  return aid === detailAssignment.id || (detailAssignment.id && aid && (detailAssignment.id.includes(aid) || aid.includes(detailAssignment.id)));
+                });
                 if (matched) {
                   const localSub = {
                     id: matched.id || `sub-${st.code}`,
+                    assignmentId: detailAssignment.id,
                     studentId: st.code,
                     studentCode: st.code,
                     maHs: st.code,
@@ -818,13 +803,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
         formatStandardStudentCode(st.id, targetClassName),
         st.code?.toLowerCase(),
         st.id?.toLowerCase(),
-        st.username?.toLowerCase(),
-        st.id?.replace(/^(st|hs|user|u)[\-_]?/i, '').replace(/[\s\-_]/g, ''),
-        st.code?.toLowerCase().replace(/[\s\-_]/g, ''),
-        st.id?.toLowerCase().replace(/[\s\-_]/g, ''),
-        normalizeStudentName(st.fullName || st.name),
-        st.fullName?.trim().toLowerCase(),
-        st.name?.trim().toLowerCase(),
+        st.username?.toLowerCase()
       ].filter(Boolean) as string[];
 
       let submission: any = null;

@@ -392,11 +392,18 @@ export function computeAssignmentTrackingData({
     if (userKey) rosterNormIds.add(userKey);
   });
 
-  // 3. Collect all submissions for this assignment
+  // 3. Collect all submissions for this assignment (strictly filtered by assignmentId)
   const allSubs: any[] = [
     ...(Array.isArray(assignment.submissions) ? assignment.submissions : []),
     ...(Array.isArray(submissionsList) ? submissionsList : [])
-  ];
+  ].filter(sub => {
+    if (!sub) return false;
+    const assignId = sub.assignmentId || sub.assignment?.id || sub.id;
+    if (assignId && assignment.id && assignId !== assignment.id && !assignment.id.includes(assignId) && !assignId.includes(assignment.id)) {
+      return false;
+    }
+    return true;
+  });
 
   const questions = assignment.questions || [];
   const questionCount = questions.length > 0 ? questions.length : 5;
