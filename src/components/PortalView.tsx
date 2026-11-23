@@ -4,20 +4,19 @@ import { UserRole, StudentRecord } from '../types';
 import { auth, ensureFirebaseAuthSession } from '../services/firebase';
 import { GoogleAuthProvider, signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
-  getStudentsFromLocalStorage,
   getAllStudentsFromLocalStorage,
-  generateDefaultClassRoster,
-  fetchClassStudentsFromFirestore,
   fetchAllStudentsFromFirestore,
   subscribeToFirestoreClassStudents,
-  saveStudentsToLocalStorage,
   sortStudentsByNameAZ,
   sortStudentsByNameZA,
   sortStudentsDescending,
   sortStudentsAscending,
   extractStudentNumericIndex,
   getStandardClassName,
-  normalizeClassKey
+  normalizeClassKey,
+  resolveClassRosterFromMemoryAndCache,
+  fetchClassRosterSingleSource,
+  ClassRosterReadResult
 } from '../services/studentStorageService';
 import { resolveTeacherNameByEmail, getCurrentTeacherProfile, verifyTeacherAuthorization } from '../services/teacherStorageService';
 import { useClassesList, normalizeClassKeyStrict, formatClassName } from '../services/classStorageService';
@@ -312,22 +311,14 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
     return getAllStudentsFromLocalStorage();
   });
 
-  // Calculate student count for any class (e.g. "Lớp 3C" or "3C")
+  // Calculate student count for any class using shared Single Source of Truth (always realList.length)
   const getClassStudentCount = (clsName: string): number => {
-    const std = getStandardClassName(clsName);
     const key = normalizeClassKey(clsName);
-    if (normalizeClassKey(selectedClass) === key && currentClassStudents.length > 0) {
-      return currentClassStudents.length;
+    if (!key) return 0;
+    if (normalizeClassKey(selectedClass) === key && displayedStudents.length > 0) {
+      return displayedStudents.length;
     }
-    if (allClassRosters[std]?.length) return allClassRosters[std].length;
-    if (allClassRosters[key]?.length) return allClassRosters[key].length;
-    for (const [rKey, rList] of Object.entries(allClassRosters)) {
-      if (normalizeClassKey(rKey) === key && Array.isArray(rList) && rList.length > 0) {
-        return rList.length;
-      }
-    }
-    const cached = getStudentsFromLocalStorage(std) || getStudentsFromLocalStorage(key);
-    return cached?.length || 0;
+    return resolveClassRosterFromMemoryAndCache(clsName, allClassRosters).realCount;
   };
 
   // Calculate total student count for a grade (e.g. "Khối 3")
@@ -336,14 +327,15 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
     return classes.reduce((sum, cls) => sum + getClassStudentCount(cls), 0);
   };
 
-  // Get current class student list (with LocalStorage & Firestore persistence)
+  // Get current class student list (shared Single Source of Truth)
   const [currentClassStudents, setCurrentClassStudents] = useState<StudentRecord[]>(() => {
-    const cached = getStudentsFromLocalStorage(selectedClass);
-    if (cached && cached.length > 0) return cached;
-    return [];
+    return resolveClassRosterFromMemoryAndCache(selectedClass).students;
   });
+  const [rosterDiagnostic, setRosterDiagnostic] = useState<ClassRosterReadResult | null>(null);
+  const [isLoadingRoster, setIsLoadingRoster] = useState<boolean>(false);
+  const [rosterReloadTick, setRosterReloadTick] = useState<number>(0);
 
-  // Load all class rosters on mount to populate class & grade counts immediately
+  // Load all class rosters on mount (read-only) to populate class & grade counts immediately
   useEffect(() => {
     ensureFirebaseAuthSession()
       .then(() => fetchAllStudentsFromFirestore())
@@ -355,53 +347,81 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
       .catch(() => {});
   }, []);
 
-  // Derived sorted student list based on current sort direction (Alphabetical A-Z by default)
+  // Derived sorted student list based on current sort direction (always passing selectedClass)
   const displayedStudents = useMemo(() => {
     if (sortDirection === 'name_asc') {
-      return sortStudentsByNameAZ(currentClassStudents);
+      return sortStudentsByNameAZ(currentClassStudents, selectedClass);
     } else if (sortDirection === 'name_desc') {
-      return sortStudentsByNameZA(currentClassStudents);
+      return sortStudentsByNameZA(currentClassStudents, selectedClass);
     } else if (sortDirection === 'desc') {
-      return sortStudentsDescending(currentClassStudents);
+      return sortStudentsDescending(currentClassStudents, selectedClass);
     } else {
-      return sortStudentsAscending(currentClassStudents);
+      return sortStudentsAscending(currentClassStudents, selectedClass);
     }
-  }, [currentClassStudents, sortDirection]);
+  }, [currentClassStudents, selectedClass, sortDirection]);
 
-  // Re-fetch and sync when selectedClass changes or window update event occurs
+  // Re-fetch and sync (STRICTLY READ-ONLY on Firestore) when selectedClass changes or Retry/update occurs
   useEffect(() => {
     let isMounted = true;
 
     const loadClassRoster = () => {
-      const cached = getStudentsFromLocalStorage(selectedClass);
-      if (cached && cached.length > 0) {
-        if (isMounted) setCurrentClassStudents(cached);
+      const cached = resolveClassRosterFromMemoryAndCache(selectedClass, allClassRosters);
+      if (isMounted && cached.realCount > 0) {
+        setCurrentClassStudents(cached.students);
       }
 
-      fetchClassStudentsFromFirestore(selectedClass)
-        .then((cloudStudents) => {
+      if (isMounted) setIsLoadingRoster(true);
+      fetchClassRosterSingleSource(selectedClass)
+        .then((result) => {
           if (!isMounted) return;
-          if (cloudStudents && cloudStudents.length > 0) {
-            setCurrentClassStudents(cloudStudents);
+          setRosterDiagnostic(result);
+          if (result.realCount > 0) {
+            setCurrentClassStudents(result.students);
             setAllClassRosters((prev) => ({
               ...prev,
-              [getStandardClassName(selectedClass)]: cloudStudents,
-              [normalizeClassKey(selectedClass)]: cloudStudents
+              [getStandardClassName(selectedClass)]: result.students,
+              [normalizeClassKey(selectedClass)]: result.students
             }));
-          } else if (!cached || cached.length === 0) {
+          } else if (cached.realCount === 0) {
             setCurrentClassStudents([]);
           }
+          setIsLoadingRoster(false);
         })
-        .catch(() => {
-          if (isMounted && (!cached || cached.length === 0)) {
+        .catch((err) => {
+          if (!isMounted) return;
+          setIsLoadingRoster(false);
+          if (cached.realCount === 0) {
             setCurrentClassStudents([]);
+            setRosterDiagnostic((prev) => ({
+              ...(prev || {
+                classKey: normalizeClassKey(selectedClass),
+                className: getStandardClassName(selectedClass),
+                students: [],
+                realCount: 0,
+                maleCount: 0,
+                femaleCount: 0,
+                storedTotalStudents: null,
+                hasCountMismatch: false,
+                mismatchWarning: null,
+                keysFound: [],
+                multiKeyWarning: null,
+                sources: {
+                  firestoreClassRosters: { keys: [], count: 0, storedTotal: null },
+                  firestoreStudentsCollection: { keys: [], count: 0 },
+                  localStorage: { keys: [], count: 0 },
+                  indexedDB: { note: 'Firestore persistentLocalCache (SDK)', rosterStored: false }
+                },
+                loadedFrom: 'error' as const
+              }),
+              emptyReason: `Lỗi kết nối Firestore: ${err?.message || String(err)}`
+            }));
           }
         });
     };
 
     loadClassRoster();
 
-    // Real-time Firestore subscription for immediate live sync
+    // Real-time Firestore subscription (read-only) for immediate live sync
     const unsubscribeSnapshot = subscribeToFirestoreClassStudents(selectedClass, (liveStudents) => {
       if (isMounted && liveStudents && liveStudents.length > 0) {
         setCurrentClassStudents(liveStudents);
@@ -424,7 +444,7 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
       unsubscribeSnapshot();
       window.removeEventListener('eduplay_k5_students_updated', handleUpdate);
     };
-  }, [selectedClass]);
+  }, [selectedClass, rosterReloadTick]);
 
   // Helper to persist teacher info
   const saveTeacherSession = (email: string, name?: string) => {
@@ -864,7 +884,7 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[11px] font-bold px-2.5 py-1 bg-amber-200/80 text-amber-900 rounded-lg">
-                  {selectedClass} ({currentClassStudents.length} học sinh)
+                  {selectedClass} ({displayedStudents.length} học sinh)
                 </span>
                 <button
                   onClick={() => {
@@ -908,14 +928,29 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
 
             {/* Avatar Grid Container with smooth scroll */}
             {displayedStudents.length === 0 ? (
-              <div className="py-14 text-center text-slate-500 bg-slate-50/80 rounded-3xl border-2 border-dashed border-slate-200 p-6 my-2">
-                <div className="w-12 h-12 rounded-2xl bg-amber-50 border border-amber-200 text-amber-500 flex items-center justify-center mx-auto mb-3">
+              <div className="py-12 text-center text-slate-500 bg-slate-50/80 rounded-3xl border-2 border-dashed border-slate-200 p-6 my-2 space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-50 border border-amber-200 text-amber-500 flex items-center justify-center mx-auto">
                   <AlertCircle className="w-6 h-6" />
                 </div>
-                <p className="text-sm font-extrabold text-slate-700">Chưa có dữ liệu học sinh trong lớp {selectedClass}</p>
-                <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
-                  Lớp học hiện chưa có danh sách học sinh. Thầy cô vui lòng cập nhật danh sách lớp trong phân hệ Quản Lý Người Dùng.
-                </p>
+                <div className="space-y-1 max-w-md mx-auto">
+                  <p className="text-sm font-extrabold text-slate-800">
+                    Danh sách lớp {selectedClass} đang trống hoặc chưa tải được
+                  </p>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    (nguyên nhân: {rosterDiagnostic?.emptyReason || (isLoadingRoster ? 'Đang tải danh sách lớp từ Cloud Firestore...' : 'Chưa tìm thấy học sinh nào trong lớp này')})
+                  </p>
+                </div>
+                <div className="pt-1 flex items-center justify-center">
+                  <button
+                    type="button"
+                    disabled={isLoadingRoster}
+                    onClick={() => setRosterReloadTick((prev) => prev + 1)}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold shadow-xs transition-all cursor-pointer active:scale-95"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingRoster ? 'animate-spin' : ''}`} />
+                    <span>{isLoadingRoster ? 'Đang tải lại...' : 'Thử lại'}</span>
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="max-h-[380px] sm:max-h-[420px] overflow-y-auto pr-1 grid grid-cols-2 sm:grid-cols-4 gap-3.5 custom-scrollbar">
@@ -923,7 +958,7 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
                   const numericIdx = extractStudentNumericIndex(st);
                   const avatar = getStudentAvatar(numericIdx > 0 ? numericIdx - 1 : 0);
                   const isSelected = selectedStudent?.id === st.id;
-                  const displayCode = st.code || st.username || `${selectedClass.replace(/Lớp\s*/i, '').toLowerCase()}${numericIdx || 1}`;
+                  const displayCode = st.studentCode || st.code || st.username || `${selectedClass.replace(/Lớp\s*/i, '').toLowerCase()}${numericIdx || 1}`;
                   const displayStt = st.stt || numericIdx;
 
                   return (

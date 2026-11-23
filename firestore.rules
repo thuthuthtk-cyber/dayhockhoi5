@@ -179,6 +179,13 @@ service cloud.firestore {
       allow delete: if isSignedIn() && isValidId(rosterId);
     }
 
+    match /public_rosters/{rosterId} {
+      allow get: if isSignedIn() && isValidId(rosterId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(rosterId) && isValidClassRoster(incoming());
+      allow delete: if isSignedIn() && isValidId(rosterId);
+    }
+
     match /students/{studentId} {
       allow get: if isSignedIn() && isValidId(studentId);
       allow list: if isSignedIn();

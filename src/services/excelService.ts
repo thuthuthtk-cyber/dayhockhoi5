@@ -3,7 +3,14 @@ import { QuestionItem, ExamPaper, StudentRecord } from '../types';
 import { formatScore, formatTotalScore, roundTotalScore, formatSubmissionDateTime } from '../utils/scoreUtils';
 import { getExamCompletion } from './examCompletionService';
 import { getStudentsFromLocalStorage, generateDefaultClassRoster, getClassStudentCount } from './studentStorageService';
-import { formatStandardStudentCode, normalizeStudentCode } from './studentCode';
+import {
+  formatStandardStudentCode,
+  normalizeStudentCode,
+  normalizeStudentName,
+  preserveRawStudentCode,
+  parseStudentCode
+} from './studentCode';
+import { pickPreferredStudentRecord } from './studentDuplicateCleanupService';
 import { sortStudentsByName } from '../utils/vietnameseNameSort';
 
 /**
@@ -445,9 +452,12 @@ export function importStudentsFromExcel(
       if (!rawFullName && !rawUsername) continue;
       if (rawFullName.toLowerCase().includes('hướng dẫn') || rawFullName.toLowerCase().includes('tổng cộng')) continue;
 
-      const sttNum =
-        parseInt(String(row[colIndices.stt] || parsedStudents.length + 1), 10) || parsedStudents.length + 1;
-      const usernameVal = rawUsername || `${prefix}${sttNum}`;
+      const rawSttNum = parseInt(String(row[colIndices.stt] || ''), 10);
+      const fallbackStt = !isNaN(rawSttNum) && rawSttNum > 0 ? rawSttNum : parsedStudents.length + 1;
+      const preservedUsername = preserveRawStudentCode(rawUsername) || `${prefix.toUpperCase()}26-27-${fallbackStt}`;
+      const parsedFromCode = parseStudentCode(preservedUsername);
+      const sttNum = parsedFromCode?.stt && parsedFromCode.stt > 0 ? parsedFromCode.stt : fallbackStt;
+      const usernameVal = preservedUsername;
       const passwordVal = String(row[colIndices.password] || '123456').replace(/^'/, '').trim() || '123456';
       const fullNameVal = rawFullName || '';
       const idCardVal = String(row[colIndices.idCard] || '').replace(/^'/, '').trim();
@@ -471,6 +481,7 @@ export function importStudentsFromExcel(
         id: `st-${prefix}-${sttNum}`,
         stt: sttNum,
         code: usernameVal,
+        studentCode: usernameVal,
         username: usernameVal,
         pin: passwordVal,
         password: passwordVal,
@@ -496,30 +507,55 @@ export function importStudentsFromExcel(
       parsedStudents.push(studentItem);
     }
 
-    // Deduplicate parsed students array to ensure strict key uniqueness
-    const seenParsedIds = new Set<string>();
-    const seenParsedCodes = new Set<string>();
-    const deduplicatedParsed: StudentRecord[] = [];
-
-    parsedStudents.forEach((st) => {
-      const codeKey = (st.code || '').toLowerCase();
-      if (codeKey && seenParsedCodes.has(codeKey)) {
-        return;
+    // Deduplicate parsed students by BOTH normalized studentCode AND normalized Vietnamese name
+    // (preferring < 100 and UPPERCASE over 1xx / duplicate rows without renumbering codes).
+    const codeDedupMap = new Map<string, StudentRecord>();
+    const noCodeList: StudentRecord[] = [];
+    parsedStudents.forEach((st, idx) => {
+      const normCode = normalizeStudentCode(st.studentCode || st.code);
+      if (normCode) {
+        const existing = codeDedupMap.get(normCode);
+        codeDedupMap.set(normCode, existing ? pickPreferredStudentRecord(existing, st) : st);
+      } else {
+        noCodeList.push({ ...st, id: st.id || `st-${prefix}-row-${idx + 1}` });
       }
-      if (codeKey) seenParsedCodes.add(codeKey);
-      deduplicatedParsed.push(st);
     });
 
-    const finalResult = deduplicatedParsed.map((st, idx) => {
-      const stt = idx + 1;
-      const id = `st-${prefix}-${stt}`;
-      seenParsedIds.add(id);
+    const nameDedupMap = new Map<string, StudentRecord>();
+    const noNameList: StudentRecord[] = [];
+    [...codeDedupMap.values(), ...noCodeList].forEach((st) => {
+      const normName = normalizeStudentName(st.fullName || st.name);
+      if (normName) {
+        const existing = nameDedupMap.get(normName);
+        nameDedupMap.set(normName, existing ? pickPreferredStudentRecord(existing, st) : st);
+      } else {
+        noNameList.push(st);
+      }
+    });
+
+    const usedIds = new Set<string>();
+    const finalResult = [...nameDedupMap.values(), ...noNameList].map((st, idx) => {
+      const rawCode = preserveRawStudentCode(st.studentCode || st.code || st.username || '');
+      const parsedFromCode = parseStudentCode(rawCode);
+      const effectiveStt =
+        parsedFromCode?.stt && parsedFromCode.stt > 0
+          ? parsedFromCode.stt
+          : typeof st.stt === 'number' && st.stt > 0
+          ? st.stt
+          : idx + 1;
+      const finalCode = rawCode || `${prefix.toUpperCase()}26-27-${effectiveStt}`;
+      let candidateId = `st-${prefix}-${effectiveStt}`;
+      if (usedIds.has(candidateId)) {
+        candidateId = `st-${prefix}-${effectiveStt}-${idx + 1}`;
+      }
+      usedIds.add(candidateId);
       return {
         ...st,
-        id,
-        stt,
-        code: st.code || `${prefix}${stt}`,
-        username: st.username || `${prefix}${stt}`
+        id: candidateId,
+        stt: effectiveStt,
+        code: finalCode,
+        studentCode: finalCode,
+        username: preserveRawStudentCode(st.username || finalCode) || finalCode
       };
     });
 

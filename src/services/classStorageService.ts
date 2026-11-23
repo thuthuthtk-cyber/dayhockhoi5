@@ -52,6 +52,34 @@ export function normalizeClassKeyStrict(rawName?: string): string {
 }
 
 /**
+ * Hàm chuẩn hóa khóa lớp dùng chung cho toàn bộ hệ thống (đọc & ghi)
+ */
+export const normalizeClassKey = normalizeClassKeyStrict;
+
+/**
+ * Trả về các biến thể khóa lớp để đọc dự phòng (chỉ đọc, không tự ghi)
+ */
+export function getClassKeyLookupVariants(rawName?: string): string[] {
+  const key = normalizeClassKeyStrict(rawName);
+  if (!key) return [];
+  const lower = key.toLowerCase();
+  const variants = new Set<string>([
+    key,
+    lower,
+    `Lớp ${key}`,
+    `Lớp ${lower}`,
+    `LỚP ${key}`,
+    `lớp ${lower}`,
+    `Lop ${key}`,
+    `lop ${lower}`
+  ]);
+  if (rawName && rawName.trim()) {
+    variants.add(rawName.trim());
+  }
+  return Array.from(variants);
+}
+
+/**
  * Format class name string uniformly to "Lớp 3C" (never "Lớp LỚP 3C")
  */
 export function formatClassName(rawName?: string): string {

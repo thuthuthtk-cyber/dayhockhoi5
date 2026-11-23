@@ -4,10 +4,13 @@ import { signInAnonymously } from 'firebase/auth';
 import { handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, getDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch, extractFirestoreErrorDetails } from './firestoreWriteTracker';
-import { formatStandardStudentCode, normalizeStudentCode } from './studentCode';
+import { formatStandardStudentCode, normalizeStudentCode, normalizeStudentName, preserveRawStudentCode, parseStudentCode, getStudentCodeLookupVariants } from './studentCode';
 import { propagateStudentCodeChange } from './unmatchedSubmissionsService';
 import { isAdmin, getAllAccessibleClasses, canManageClass, UserPermissionsProfile } from '../utils/permissions';
 import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../utils/firestoreSanitizer';
+import { normalizeClassKeyStrict, getClassKeyLookupVariants } from './classStorageService';
+import { pickPreferredStudentRecord, syncPublicRosterToFirestore } from './studentDuplicateCleanupService';
+import { clearMemoryTrackingData, clearIndexedDBTrackingData } from './assignmentTrackingData';
 // import { safeStorage } from '../utils/safeStorage';
 
 const PRIMARY_SCHOOL_SUBJECTS = [
@@ -20,24 +23,18 @@ export const EDUPLAY_STUDENTS_DB_KEY = 'eduplay_k5_students_database';
 export const EDUPLAY_CLASSES_DATA_KEY = 'eduplay_k5_classes_data';
 
 /**
- * Standardize class identifier to uppercase (e.g. "Lớp LỚP 3C" -> "3C", "Lớp 3C" -> "3C", "3c" -> "3C")
+ * Hàm chuẩn hóa khóa lớp dùng chung (bỏ "Lớp"/"lop", bỏ khoảng trắng, viết hoa: " lớp 5d " -> "5D")
  */
-export function normalizeClassKey(className: string): string {
-  if (!className) return '5C';
-  let s = String(className).trim().replace(/\s+/g, ' ');
-  while (/^(lớp|lop)\b[\s:_-]*/i.test(s)) {
-    s = s.replace(/^(lớp|lop)\b[\s:_-]*/i, '').trim();
-  }
-  return s.replace(/\s+/g, '').toUpperCase() || '5C';
+export function normalizeClassKey(className?: string): string {
+  return normalizeClassKeyStrict(className);
 }
 
 /**
  * Convert normalized key back to standard display format (e.g. "5c", "LỚP 5C", "Lớp LỚP 5C" -> "Lớp 5C")
  */
-export function getStandardClassName(classKeyOrName: string): string {
-  if (!classKeyOrName) return 'Lớp 5C';
+export function getStandardClassName(classKeyOrName?: string): string {
   const key = normalizeClassKey(classKeyOrName);
-  return `Lớp ${key}`;
+  return key ? `Lớp ${key}` : '';
 }
 
 /**
@@ -64,17 +61,19 @@ export function extractStudentNumericIndex(student: StudentRecord): number {
 }
 
 /**
- * Deduplicate student records and guarantee clean, strictly unique IDs and consistent indexing
+ * Deduplicate student records and guarantee clean, strictly unique IDs without dropping non-5C classes
+ * or re-numbering existing STT / mutating existing stored studentCode.
  */
 export function deduplicateAndNormalizeStudents(
   students: StudentRecord[],
-  className: string = 'Lớp 5C'
+  className?: string
 ): StudentRecord[] {
   if (!Array.isArray(students)) return [];
 
-  const stdName = getStandardClassName(className);
-  const key = normalizeClassKey(stdName); // e.g. "5C"
-  const seenCodes = new Set<string>();
+  const targetKey = className ? normalizeClassKey(className) : '';
+  const stdName = targetKey ? `Lớp ${targetKey}` : '';
+  const codeSlotMap = new Map<string, number>();
+  const nameSlotMap = new Map<string, number>();
   const uniqueStudents: StudentRecord[] = [];
 
   students.forEach((st) => {
@@ -82,64 +81,108 @@ export function deduplicateAndNormalizeStudents(
     const rawName = (st.name || st.fullName || '').trim();
     if (!rawName) return;
 
-    const rawCode = normalizeStudentCode(st.studentCode || st.code || '');
-    
-    // Filter out stray students belonging to a different class prefix if code explicitly indicates another class
-    if (rawCode) {
-      const classPrefixMatch = rawCode.match(/^([A-Z0-9]+)\d{2}-\d{2}-\d+$/);
-      if (classPrefixMatch && classPrefixMatch[1] && classPrefixMatch[1] !== key) {
+    const rawStoredCode = preserveRawStudentCode(st.studentCode || st.code || '');
+    const canonicalCode = normalizeStudentCode(rawStoredCode);
+    const effectiveKey = targetKey || normalizeClassKey(st.className || (st as any).classKey || (st as any).classId);
+
+    // Filter out stray students ONLY when targetKey is explicitly known and code explicitly belongs to another class
+    if (canonicalCode && effectiveKey) {
+      const classPrefixMatch = canonicalCode.match(/^([A-Z0-9]+)\d{2}-\d{2}-\d+$/);
+      if (classPrefixMatch && classPrefixMatch[1] && classPrefixMatch[1] !== effectiveKey) {
         return;
-      }
-      // Drop stray high-index test codes like 100+ if class size is normal (< 60)
-      const indexMatch = rawCode.match(/(\d+)$/);
-      if (indexMatch && indexMatch[1]) {
-        const num = parseInt(indexMatch[1], 10);
-        if (!isNaN(num) && num > 60 && !String(st.id || '').includes(key.toLowerCase())) {
-          return;
-        }
       }
     }
 
-    const dedupKey = rawCode || rawName.toLowerCase();
-    if (seenCodes.has(dedupKey)) {
+    const normName = normalizeStudentName(st.fullName || st.name);
+    const codeKey = canonicalCode;
+    const nameKey = normName || '';
+
+    const existingIdxByCode = codeKey ? codeSlotMap.get(codeKey) : undefined;
+    const existingIdxByName = nameKey ? nameSlotMap.get(nameKey) : undefined;
+    const matchedIdx = existingIdxByCode !== undefined ? existingIdxByCode : existingIdxByName;
+
+    if (matchedIdx !== undefined) {
+      const currentWinner = uniqueStudents[matchedIdx];
+      const nextWinner = pickPreferredStudentRecord(currentWinner, st);
+      if (nextWinner !== currentWinner) {
+        uniqueStudents[matchedIdx] = nextWinner;
+        const winCode = normalizeStudentCode(preserveRawStudentCode(nextWinner.studentCode || nextWinner.code || ''));
+        const winName = normalizeStudentName(nextWinner.fullName || nextWinner.name);
+        if (winCode) codeSlotMap.set(winCode, matchedIdx);
+        if (winName) nameSlotMap.set(winName, matchedIdx);
+      }
       return;
     }
-    seenCodes.add(dedupKey);
+
+    const newIdx = uniqueStudents.length;
     uniqueStudents.push(st);
+    if (codeKey) codeSlotMap.set(codeKey, newIdx);
+    if (nameKey) nameSlotMap.set(nameKey, newIdx);
   });
+
+  // Track used STTs so we never renumber existing STTs; only assign next unused STT if missing
+  const usedStts = new Set<number>();
+  uniqueStudents.forEach((st) => {
+    const parsed = parseStudentCode(st.studentCode || st.code);
+    const existingStt = typeof st.stt === 'number' && st.stt > 0 ? st.stt : (parsed?.stt || 0);
+    if (existingStt > 0) usedStts.add(existingStt);
+  });
+  let maxExistingStt = usedStts.size > 0 ? Math.max(...Array.from(usedStts)) : 0;
 
   const finalSeenIds = new Set<string>();
   return uniqueStudents.map((st, idx) => {
-    const stt = idx + 1;
-    const existingCode = normalizeStudentCode(st.studentCode || st.code);
-    const code = existingCode && existingCode.startsWith(key)
-      ? existingCode
-      : formatStandardStudentCode(existingCode || `${key}26-27-${stt}`, key, stt);
-    
+    const rowKey = targetKey || normalizeClassKey(st.className || (st as any).classKey || (st as any).classId) || '5C';
+    const rowStdName = stdName || getStandardClassName(st.className || rowKey) || `Lớp ${rowKey}`;
+
+    const rawStoredCode = preserveRawStudentCode(st.studentCode || st.code || '');
+    const parsedFromCode = parseStudentCode(rawStoredCode);
+    let assignedStt =
+      typeof st.stt === 'number' && !isNaN(st.stt) && st.stt > 0
+        ? st.stt
+        : (parsedFromCode?.stt || 0);
+
+    if (!assignedStt) {
+      maxExistingStt += 1;
+      assignedStt = maxExistingStt;
+    }
+
+    // Preserve existing stored code unchanged when it already belongs to this class or is valid standard format
+    let code = rawStoredCode;
+    if (!code) {
+      code = `${rowKey}26-27-${assignedStt}`;
+    } else if (!/^[A-Z0-9]+\d{2}-\d{2}-\d+$/.test(code)) {
+      code = formatStandardStudentCode(code, rowKey, assignedStt);
+    }
+
     // Ensure every record has a unique ID and no collisions
-    let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${key.toLowerCase()}-${stt}`;
+    let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${rowKey.toLowerCase()}-${assignedStt}`;
     if (finalSeenIds.has(id)) {
-      id = `st-${key.toLowerCase()}-${stt}-${idx + 1}`;
+      id = `st-${rowKey.toLowerCase()}-${assignedStt}-${idx + 1}`;
     }
     finalSeenIds.add(id);
 
-    const sddcn = (st.sddcn && st.sddcn.trim().length > 0) 
-      ? st.sddcn.trim() 
+    const sddcn = (st.sddcn && st.sddcn.trim().length > 0)
+      ? st.sddcn.trim()
       : (st.idCard && st.idCard.trim().length > 0)
       ? st.idCard.trim()
       : '';
 
+    const rawName = (st.name || st.fullName || '').trim();
+    const rawFullName = (st.fullName || st.name || '').trim();
+
     return {
       ...st,
       id,
-      stt,
+      name: rawName,
+      fullName: rawFullName,
+      stt: assignedStt,
       code,
       studentCode: code,
       sddcn,
       studentPersistentId: sddcn,
       academicYear: st.academicYear || '2026-2027',
-      username: st.username ? normalizeStudentCode(st.username) : code,
-      className: st.className || stdName,
+      username: st.username ? preserveRawStudentCode(st.username) : code,
+      className: rowStdName,
       pin: st.pin || st.password || '123456',
       password: st.password || st.pin || '123456'
     };
@@ -162,22 +205,19 @@ export function getVietnameseNameSortKey(fullName: string): string {
 
 /**
  * Sort students array in ALPHABETICAL order A-Z by Vietnamese Name
- * (Tên từ A đến Z, học sinh vần A xếp trên cùng, vần V/Z ở cuối)
  */
-export function sortStudentsByNameAZ(students: StudentRecord[]): StudentRecord[] {
+export function sortStudentsByNameAZ(students: StudentRecord[], className?: string): StudentRecord[] {
   if (!Array.isArray(students)) return [];
-  const deduped = deduplicateAndNormalizeStudents(students);
+  const deduped = deduplicateAndNormalizeStudents(students, className);
   return deduped.sort((a, b) => {
     const nameA = (a.fullName || a.name || '').trim();
     const nameB = (b.fullName || b.name || '').trim();
 
-    // 1. So sánh theo Tên (từ cuối cùng) theo chuẩn Tiếng Việt (A -> Z)
     const keyA = getVietnameseNameSortKey(nameA);
     const keyB = getVietnameseNameSortKey(nameB);
     const cmpName = keyA.localeCompare(keyB, 'vi', { sensitivity: 'base' });
     if (cmpName !== 0) return cmpName;
 
-    // 2. Nếu cùng Tên, so sánh Họ và Tên đệm
     const cmpFull = nameA.localeCompare(nameB, 'vi', { sensitivity: 'base' });
     if (cmpFull !== 0) return cmpFull;
 
@@ -188,9 +228,9 @@ export function sortStudentsByNameAZ(students: StudentRecord[]): StudentRecord[]
 /**
  * Sort students array in REVERSE ALPHABETICAL order Z-A by Vietnamese Name
  */
-export function sortStudentsByNameZA(students: StudentRecord[]): StudentRecord[] {
+export function sortStudentsByNameZA(students: StudentRecord[], className?: string): StudentRecord[] {
   if (!Array.isArray(students)) return [];
-  const deduped = deduplicateAndNormalizeStudents(students);
+  const deduped = deduplicateAndNormalizeStudents(students, className);
   return deduped.sort((a, b) => {
     const nameA = (a.fullName || a.name || '').trim();
     const nameB = (b.fullName || b.name || '').trim();
@@ -210,14 +250,14 @@ export function sortStudentsByNameZA(students: StudentRecord[]): StudentRecord[]
 /**
  * Sort students array in DESCENDING order by Student ID / STT (e.g. 37, 36, ... 12, 11, ... 1)
  */
-export function sortStudentsDescending(students: StudentRecord[]): StudentRecord[] {
+export function sortStudentsDescending(students: StudentRecord[], className?: string): StudentRecord[] {
   if (!Array.isArray(students)) return [];
-  const deduped = deduplicateAndNormalizeStudents(students);
+  const deduped = deduplicateAndNormalizeStudents(students, className);
   return deduped.sort((a, b) => {
     const numA = extractStudentNumericIndex(a);
     const numB = extractStudentNumericIndex(b);
     if (numA !== numB) {
-      return numB - numA; // Descending: Largest to Smallest
+      return numB - numA;
     }
     return (b.id || '').localeCompare(a.id || '', undefined, { numeric: true, sensitivity: 'base' });
   });
@@ -226,14 +266,14 @@ export function sortStudentsDescending(students: StudentRecord[]): StudentRecord
 /**
  * Sort students array in ASCENDING order by Student ID / STT (e.g. 1, 2, ... 37)
  */
-export function sortStudentsAscending(students: StudentRecord[]): StudentRecord[] {
+export function sortStudentsAscending(students: StudentRecord[], className?: string): StudentRecord[] {
   if (!Array.isArray(students)) return [];
-  const deduped = deduplicateAndNormalizeStudents(students);
+  const deduped = deduplicateAndNormalizeStudents(students, className);
   return deduped.sort((a, b) => {
     const numA = extractStudentNumericIndex(a);
     const numB = extractStudentNumericIndex(b);
     if (numA !== numB) {
-      return numA - numB; // Ascending: Smallest to Largest
+      return numA - numB;
     }
     return (a.id || '').localeCompare(b.id || '', undefined, { numeric: true, sensitivity: 'base' });
   });
@@ -351,23 +391,32 @@ export function getStudentsFromLocalStorage(className: string): StudentRecord[] 
   if (typeof window === 'undefined') return null;
 
   try {
-    const stdName = getStandardClassName(className);
     const key = normalizeClassKey(className);
+    if (!key) return null;
+    const stdName = `Lớp ${key}`;
 
     // If explicitly cleared, return []
     if (localStorage.getItem(`eduplay_k5_cleared_${key}`) === 'true' || localStorage.getItem(`eduplay_k5_cleared_${key.toLowerCase()}`) === 'true') {
       return [];
     }
 
-    // 1. Check direct per-class key (e.g. eduplay_k5_students_5c, eduplay_k5_students_5d)
-    const directData = localStorage.getItem(`eduplay_k5_students_${key}`) || localStorage.getItem(`eduplay_k5_students_${key.toLowerCase()}`);
-    if (directData !== null) {
-      try {
-        const parsed = JSON.parse(directData);
-        if (Array.isArray(parsed)) {
-          return deduplicateAndNormalizeStudents(parsed, stdName);
-        }
-      } catch {}
+    // 1. Check direct per-class key and variant keys (read-only)
+    const candidateKeys = [
+      `eduplay_k5_students_${key}`,
+      `eduplay_k5_students_${key.toLowerCase()}`,
+      `eduplay_k5_students_${stdName}`,
+      `eduplay_k5_students_${stdName.toLowerCase()}`
+    ];
+    for (const lsKey of candidateKeys) {
+      const directData = localStorage.getItem(lsKey);
+      if (directData !== null) {
+        try {
+          const parsed = JSON.parse(directData);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return deduplicateAndNormalizeStudents(parsed, stdName);
+          }
+        } catch {}
+      }
     }
 
     // 2. Check full database key (eduplay_k5_students_database)
@@ -376,13 +425,13 @@ export function getStudentsFromLocalStorage(className: string): StudentRecord[] 
       try {
         const parsedDb = JSON.parse(fullDbData);
         if (parsedDb && typeof parsedDb === 'object') {
-          if (Array.isArray(parsedDb[stdName])) {
+          if (Array.isArray(parsedDb[stdName]) && parsedDb[stdName].length > 0) {
             return deduplicateAndNormalizeStudents(parsedDb[stdName], stdName);
           }
-          if (Array.isArray(parsedDb[key])) {
+          if (Array.isArray(parsedDb[key]) && parsedDb[key].length > 0) {
             return deduplicateAndNormalizeStudents(parsedDb[key], stdName);
           }
-          if (Array.isArray(parsedDb[key.toLowerCase()])) {
+          if (Array.isArray(parsedDb[key.toLowerCase()]) && parsedDb[key.toLowerCase()].length > 0) {
             return deduplicateAndNormalizeStudents(parsedDb[key.toLowerCase()], stdName);
           }
           for (const [rawK, listVal] of Object.entries(parsedDb)) {
@@ -394,20 +443,17 @@ export function getStudentsFromLocalStorage(className: string): StudentRecord[] 
       } catch {}
     }
 
-    // 3. Fallback danh sách mặc định chuẩn hóa theo sĩ số lớp (chỉ khi chưa từng lưu/xóa)
-    if (key === '5C' || stdName.includes('5C')) {
-      const defaultRoster = generateDefaultClassRoster('Lớp 5C', 38);
-      try {
-        localStorage.setItem(`eduplay_k5_students_${key}`, JSON.stringify(defaultRoster));
-      } catch {}
-      return defaultRoster;
-    }
-    if (key === '3C' || stdName.includes('3C')) {
-      const defaultRoster = getDefault3CRoster();
-      try {
-        localStorage.setItem(`eduplay_k5_students_${key}`, JSON.stringify(defaultRoster));
-      } catch {}
-      return defaultRoster;
+    // Read-only fallback check if direct key held an explicit empty array
+    for (const lsKey of candidateKeys) {
+      const directData = localStorage.getItem(lsKey);
+      if (directData !== null) {
+        try {
+          const parsed = JSON.parse(directData);
+          if (Array.isArray(parsed)) {
+            return [];
+          }
+        } catch {}
+      }
     }
   } catch (err) {
     console.warn('Lỗi đọc LocalStorage học sinh:', err);
@@ -533,10 +579,23 @@ export function saveStudentsToLocalStorage(className: string, students: StudentR
 
     const cleaned = deduplicateAndNormalizeStudents(students, stdName);
 
-    // 1. Save to direct per-class key (e.g. eduplay_k5_students_5b)
+    // Remove stale localStorage variant keys for this class (e.g. lowercase or "Lớp 5D")
+    const staleKeys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const lsKey = localStorage.key(i);
+      if (lsKey && lsKey.startsWith('eduplay_k5_students_') && lsKey !== EDUPLAY_STUDENTS_DB_KEY) {
+        const suffix = lsKey.replace('eduplay_k5_students_', '');
+        if (normalizeClassKey(suffix) === key && lsKey !== `eduplay_k5_students_${key}`) {
+          staleKeys.push(lsKey);
+        }
+      }
+    }
+    staleKeys.forEach((k) => localStorage.removeItem(k));
+
+    // 1. Save to canonical direct per-class key (e.g. eduplay_k5_students_5D)
     localStorage.setItem(`eduplay_k5_students_${key}`, JSON.stringify(cleaned));
 
-    // 2. Update the full database object
+    // 2. Update the full database object (remove variant keys for this class)
     let fullDb: Record<string, StudentRecord[]> = {};
     const fullDbData = localStorage.getItem(EDUPLAY_STUDENTS_DB_KEY);
     if (fullDbData) {
@@ -546,7 +605,13 @@ export function saveStudentsToLocalStorage(className: string, students: StudentR
         fullDb = {};
       }
     }
+    Object.keys(fullDb).forEach((rawK) => {
+      if (normalizeClassKey(rawK) === key && rawK !== stdName && rawK !== key) {
+        delete fullDb[rawK];
+      }
+    });
     fullDb[stdName] = cleaned;
+    fullDb[key] = cleaned;
     localStorage.setItem(EDUPLAY_STUDENTS_DB_KEY, JSON.stringify(fullDb));
 
     // 3. Dispatch real-time events for instant UI reactivity across components asynchronously
@@ -660,7 +725,7 @@ export function clearAllStudentsInClass(className: string): { success: boolean; 
     localStorage.setItem(`eduplay_k5_cleared_${classKey.toLowerCase()}`, 'true');
     saveStudentsToLocalStorage(stdName, []);
     localStorage.setItem(`eduplay_k5_students_${classKey}`, JSON.stringify([]));
-    localStorage.setItem(`eduplay_k5_students_${classKey.toLowerCase()}`, JSON.stringify([]));
+    localStorage.removeItem(`eduplay_k5_students_${classKey.toLowerCase()}`);
 
     let fullDb: Record<string, StudentRecord[]> = {};
     const fullDbData = localStorage.getItem(EDUPLAY_STUDENTS_DB_KEY);
@@ -669,10 +734,17 @@ export function clearAllStudentsInClass(className: string): { success: boolean; 
         fullDb = JSON.parse(fullDbData) || {};
       } catch {}
     }
+    Object.keys(fullDb).forEach((rawK) => {
+      if (normalizeClassKey(rawK) === classKey && rawK !== stdName && rawK !== classKey) {
+        delete fullDb[rawK];
+      }
+    });
     fullDb[stdName] = [];
     fullDb[classKey] = [];
     localStorage.setItem(EDUPLAY_STUDENTS_DB_KEY, JSON.stringify(fullDb));
 
+    clearMemoryTrackingData();
+    clearIndexedDBTrackingData().catch(() => {});
     syncClassStudentsToFirestore(stdName, []).catch(() => {});
 
     window.dispatchEvent(
@@ -714,102 +786,175 @@ export async function deleteStudentPermanently(
     const stdName = getStandardClassName(className);
     const classKey = normalizeClassKey(className);
 
-    // 1. Get current list from LocalStorage / memory
-    const currentList = getStudentsFromLocalStorage(stdName) || [];
-    
-    // Robust filter checking ID, Code, SDDCN, or exact name + DOB
-    const filtered = currentList.filter(s => {
+    // 1. Gather current list from LocalStorage AND Firestore so no stale cloud entries are left behind
+    const localCurrent = getStudentsFromLocalStorage(stdName) || [];
+    const cloudCurrent = (await fetchClassStudentsFromFirestore(stdName)) || [];
+    const combinedMap = new Map<string, StudentRecord>();
+    [...localCurrent, ...cloudCurrent].forEach((s) => {
+      const k = normalizeStudentCode(s.studentCode || s.code) || s.id || normalizeStudentName(s.fullName || s.name);
+      if (k) {
+        const existing = combinedMap.get(k);
+        combinedMap.set(k, existing ? pickPreferredStudentRecord(existing, s) : s);
+      }
+    });
+    const currentList = Array.from(combinedMap.values());
+
+    const targetCodeNorm = normalizeStudentCode(student.studentCode || student.code);
+    const targetNameNorm = normalizeStudentName(student.fullName || student.name);
+
+    // Filter out matching student by ID, normalized Code, SDDCN, or normalized Name+DOB (or exact code match)
+    const filtered = currentList.filter((s) => {
       if (student.id && s.id && s.id === student.id) return false;
-      if (student.code && s.code && s.code.toLowerCase() === student.code.toLowerCase()) return false;
+      const sCodeNorm = normalizeStudentCode(s.studentCode || s.code);
+      if (targetCodeNorm && sCodeNorm && targetCodeNorm === sCodeNorm) return false;
       if (student.sddcn && s.sddcn && s.sddcn === student.sddcn) return false;
-      if (s.name === student.name && s.dob === student.dob && s.dob) return false;
+      const sNameNorm = normalizeStudentName(s.fullName || s.name);
+      if (targetNameNorm && sNameNorm && targetNameNorm === sNameNorm) {
+        if (!student.dob || !s.dob || s.dob === student.dob) return false;
+      }
       return true;
     });
 
     const updated = deduplicateAndNormalizeStudents(filtered, stdName);
 
-    // 2. Save updated list to LocalStorage immediately
+    // 2. Save updated list to LocalStorage immediately & clear variant keys
     saveStudentsToLocalStorage(stdName, updated);
-    saveStudentsToLocalStorage(classKey, updated);
 
-    // 3. Sync to Firestore
+    // 3. Sync ALL 3 Firestore collections (`class_rosters`, `public_rosters`, `students`) + `classes` + IndexedDB
     if (db) {
       await ensureFirebaseAuthSession();
+      const nowIso = new Date().toISOString();
       const maleCount = updated.filter((s) => s.gender === 'Nam').length;
       const femaleCount = updated.filter((s) => s.gender === 'Nữ').length;
-
-      // 3a. Update 'class_rosters' document (uppercase key)
-      const rosterRefUpper = doc(db, 'class_rosters', classKey);
-      await trackedSetDoc(
-        rosterRefUpper,
-        {
-          className: stdName,
+      const safeClassKey = sanitizeFirestoreDocId(classKey, classKey);
+      const cleanUpdated = updated.map((s) =>
+        sanitizeForFirestore({
+          ...s,
           classKey,
-          totalStudents: updated.length,
-          male: maleCount,
-          female: femaleCount,
-          students: updated,
-          updatedAt: new Date().toISOString()
-        },
-        { merge: true }
+          className: stdName,
+          grade: 'Khối 5',
+          updatedAt: nowIso
+        })
       );
 
-      // Also update lowercase key if present
-      if (classKey !== classKey.toLowerCase()) {
+      // 3a. Overwrite canonical 'class_rosters/{KEY}' (without merge so removed elements never persist)
+      const rosterRefUpper = doc(db, 'class_rosters', safeClassKey);
+      await trackedSetDoc(
+        rosterRefUpper,
+        sanitizeForFirestore({
+          className: stdName,
+          classKey,
+          grade: 'Khối 5',
+          totalStudents: cleanUpdated.length,
+          male: maleCount,
+          female: femaleCount,
+          students: cleanUpdated,
+          updatedAt: nowIso
+        }),
+        undefined,
+        { isUserInitiated: true, actionType: 'admin_batch' }
+      );
+
+      // Remove or clean any variant class_rosters docs (lowercase `5d`, `Lớp 5D`, etc.)
+      const rosterVariantIds = getClassKeyLookupVariants(classKey).filter((v) => v !== safeClassKey);
+      for (const vid of rosterVariantIds) {
+        const safeVid = sanitizeFirestoreDocId(vid, '');
+        if (!safeVid || safeVid === safeClassKey) continue;
         try {
-          const lowerRef = doc(db, 'class_rosters', classKey.toLowerCase());
-          const lowerSnap = await getDoc(lowerRef);
-          if (lowerSnap.exists()) {
-            await trackedSetDoc(
-              lowerRef,
-              {
-                className: stdName,
-                classKey: classKey.toLowerCase(),
-                totalStudents: updated.length,
-                male: maleCount,
-                female: femaleCount,
-                students: updated,
-                updatedAt: new Date().toISOString()
-              },
-              { merge: true }
-            );
+          const vSnap = await getDoc(doc(db, 'class_rosters', safeVid));
+          if (vSnap.exists()) {
+            try {
+              await trackedDeleteDoc(doc(db, 'class_rosters', safeVid), { isUserInitiated: true, actionType: 'admin_batch' });
+            } catch {
+              await trackedSetDoc(
+                doc(db, 'class_rosters', safeVid),
+                sanitizeForFirestore({
+                  className: stdName,
+                  classKey: safeVid,
+                  totalStudents: 0,
+                  male: 0,
+                  female: 0,
+                  students: [],
+                  updatedAt: nowIso
+                }),
+                undefined,
+                { isUserInitiated: true, actionType: 'admin_batch' }
+              );
+            }
           }
-        } catch (err) {
-          console.warn('Lower roster sync warning:', err);
-        }
+        } catch {}
       }
 
-      // 3b. Delete individual student document from 'students' collection if exists
-      if (student.id) {
-        try {
-          await trackedDeleteDoc(doc(db, 'students', student.id));
-        } catch (err) {
-          console.warn(`Could not delete doc students/${student.id}:`, err);
-        }
-      }
-      if (student.code) {
-        try {
-          await trackedDeleteDoc(doc(db, 'students', student.code));
-        } catch (err) {
-          console.warn(`Could not delete doc students/${student.code}:`, err);
-        }
-      }
+      // 3b. Synchronize 'public_rosters/{KEY}' (and remove variants)
+      await syncPublicRosterToFirestore(stdName, cleanUpdated as StudentRecord[]).catch(() => {});
 
-      // Delete by query if any matching document exists in 'students'
+      // 3c. Delete ALL matching docs in 'students' collection (ID, code variants, studentCode field, and class scan)
+      const studentDocIdsToDelete = new Set<string>();
+      if (student.id) studentDocIdsToDelete.add(student.id);
+      getStudentCodeLookupVariants(student.studentCode || student.code).forEach((v) => studentDocIdsToDelete.add(v));
+
       try {
-        if (student.code) {
-          const qCode = query(collection(db, 'students'), where('code', '==', student.code));
-          const qSnap = await getDocs(qCode);
-          if (!qSnap.empty) {
-            const batch = trackedWriteBatch(db);
-            qSnap.forEach(d => batch.delete(d.ref));
-            await batch.commit();
-          }
+        const codeVariants = getStudentCodeLookupVariants(student.studentCode || student.code).slice(0, 10);
+        if (codeVariants.length > 0) {
+          const [qCodeSnap, qStudentCodeSnap] = await Promise.all([
+            getDocs(query(collection(db, 'students'), where('code', 'in', codeVariants))),
+            getDocs(query(collection(db, 'students'), where('studentCode', 'in', codeVariants)))
+          ]);
+          qCodeSnap.forEach((d) => studentDocIdsToDelete.add(d.id));
+          qStudentCodeSnap.forEach((d) => studentDocIdsToDelete.add(d.id));
         }
+        // Scan class docs in 'students' to catch mismatched docIds or same-name stale docs
+        const classVariants = getClassKeyLookupVariants(classKey).slice(0, 10);
+        const [qClsKeySnap, qClsNameSnap] = await Promise.all([
+          getDocs(query(collection(db, 'students'), where('classKey', '==', classKey))),
+          classVariants.length > 0
+            ? getDocs(query(collection(db, 'students'), where('className', 'in', classVariants)))
+            : Promise.resolve(null as any)
+        ]);
+        const checkClassSnap = (snap: any) => {
+          if (!snap) return;
+          snap.forEach((d: any) => {
+            const data = d.data() as any;
+            const dCodeNorm = normalizeStudentCode(data?.studentCode || data?.code || d.id);
+            const dNameNorm = normalizeStudentName(data?.fullName || data?.name);
+            if (
+              (student.id && d.id === student.id) ||
+              (targetCodeNorm && dCodeNorm === targetCodeNorm) ||
+              (student.sddcn && data?.sddcn === student.sddcn) ||
+              (targetNameNorm && dNameNorm === targetNameNorm && (!student.dob || !data?.dob || data.dob === student.dob))
+            ) {
+              studentDocIdsToDelete.add(d.id);
+            }
+          });
+        };
+        checkClassSnap(qClsKeySnap);
+        checkClassSnap(qClsNameSnap);
       } catch (err) {
         console.warn('Query delete student warning:', err);
       }
+
+      const deleteIdsArr = Array.from(studentDocIdsToDelete).filter(Boolean);
+      for (let i = 0; i < deleteIdsArr.length; i += 450) {
+        const chunk = deleteIdsArr.slice(i, i + 450);
+        const batch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+        chunk.forEach((idToDel) => batch.delete(doc(db, 'students', idToDel)));
+        await batch.commit();
+      }
+
+      // 3d. Update 'classes/{KEY}' totalStudents
+      try {
+        await trackedSetDoc(
+          doc(db, 'classes', safeClassKey),
+          sanitizeForFirestore({ id: classKey, name: stdName, totalStudents: cleanUpdated.length, updatedAt: nowIso }),
+          { merge: true },
+          { isUserInitiated: true, actionType: 'admin_batch' }
+        );
+      } catch {}
     }
+
+    // Clear IndexedDB & memory tracking cache
+    clearMemoryTrackingData();
+    await clearIndexedDBTrackingData().catch(() => {});
 
     // 4. Dispatch live sync events asynchronously
     setTimeout(() => {
@@ -881,9 +1026,9 @@ export async function syncClassStudentsToFirestore(
       };
     }
 
-    const cleanInputClass = (className || '').trim() || '5C';
-    const stdName = getStandardClassName(cleanInputClass);
+    const cleanInputClass = (className || '').trim();
     const classKey = normalizeClassKey(cleanInputClass);
+    const stdName = getStandardClassName(classKey);
     if (!classKey || /^5[AB]\d*$/i.test(classKey)) {
       return { success: false, error: 'Lớp học không hợp lệ hoặc không thuộc Khối 5.', code: 'invalid-argument' };
     }
@@ -896,17 +1041,18 @@ export async function syncClassStudentsToFirestore(
     const cleanedRaw = deduplicateAndNormalizeStudents(students, stdName);
     const cleaned = cleanedRaw.map((s, idx) => {
       const currentStt = s.stt && s.stt > 0 ? s.stt : (idx + 1);
-      const existingCode = s.studentCode || s.code;
-      const standardizedCode = formatStandardStudentCode(existingCode, classKey, currentStt);
-      const normCode = normalizeStudentCode(standardizedCode);
+      const existingCode = preserveRawStudentCode(s.studentCode || s.code);
+      const standardizedCode = existingCode && /^[A-Z0-9]+\d{2}-\d{2}-\d+$/.test(existingCode)
+        ? existingCode
+        : preserveRawStudentCode(formatStandardStudentCode(existingCode, classKey, currentStt));
 
       return sanitizeForFirestore({
         ...s,
         id: s.id || `st-${classKey.toLowerCase()}-${currentStt}`,
         stt: currentStt,
-        code: normCode,
-        studentCode: normCode,
-        username: normalizeStudentCode(s.username || normCode),
+        code: standardizedCode,
+        studentCode: standardizedCode,
+        username: preserveRawStudentCode(s.username || standardizedCode),
         className: stdName,
         classKey,
         grade: normalizedGrade,
@@ -919,7 +1065,7 @@ export async function syncClassStudentsToFirestore(
     const maleCount = cleaned.filter((s) => s.gender === 'Nam').length;
     const femaleCount = cleaned.filter((s) => s.gender === 'Nữ').length;
 
-    // 1. Save full roster document in 'class_rosters' collection using exact classKey (e.g. 5C, 5D)
+    // 1. Overwrite full roster document in 'class_rosters/{KEY}' (without merge so old array/legacy fields never linger)
     const rosterRef = doc(db, 'class_rosters', safeClassKey);
     const rosterPayload = sanitizeForFirestore({
       className: stdName,
@@ -934,11 +1080,89 @@ export async function syncClassStudentsToFirestore(
     await trackedSetDoc(
       rosterRef,
       rosterPayload,
-      { merge: true },
+      undefined,
       { isUserInitiated: true, actionType: 'admin_batch' }
     );
 
-    // 2. Write every student document directly into 'students' collection using writeBatch
+    // 1b. Clean/delete non-canonical variant class_rosters docs (e.g. `5d`, `Lớp 5D`)
+    const rosterVariants = getClassKeyLookupVariants(classKey).filter((v) => v !== safeClassKey);
+    for (const vid of rosterVariants) {
+      const safeVid = sanitizeFirestoreDocId(vid, '');
+      if (!safeVid || safeVid === safeClassKey) continue;
+      try {
+        const vSnap = await getDoc(doc(db, 'class_rosters', safeVid));
+        if (vSnap.exists()) {
+          try {
+            await trackedDeleteDoc(doc(db, 'class_rosters', safeVid), { isUserInitiated: true, actionType: 'admin_batch' });
+          } catch {
+            await trackedSetDoc(
+              doc(db, 'class_rosters', safeVid),
+              sanitizeForFirestore({
+                className: stdName,
+                classKey: safeVid,
+                grade: normalizedGrade,
+                totalStudents: 0,
+                male: 0,
+                female: 0,
+                students: [],
+                updatedAt: nowIso
+              }),
+              undefined,
+              { isUserInitiated: true, actionType: 'admin_batch' }
+            );
+          }
+        }
+      } catch {}
+    }
+
+    // 2. Write every student document directly into 'students' collection AND delete stale docs of this class not in `cleaned`
+    const validDocIds = new Set<string>();
+    const validNormCodes = new Set<string>();
+    cleaned.forEach((studentDoc) => {
+      const studentDocId = sanitizeFirestoreDocId(
+        studentDoc.studentCode || studentDoc.id || `${classKey}_${studentDoc.stt}`,
+        `st_${classKey}_${studentDoc.stt}`
+      );
+      validDocIds.add(studentDocId);
+      const normCode = normalizeStudentCode(studentDoc.studentCode || studentDoc.code);
+      if (normCode) validNormCodes.add(normCode);
+    });
+
+    // Delete stale `students` documents belonging to this class whose normalized code & docId are NOT in `cleaned`
+    try {
+      const staleDocIds = new Set<string>();
+      const classVariants = getClassKeyLookupVariants(classKey).slice(0, 10);
+      const [qKeySnap, qNameSnap] = await Promise.all([
+        getDocs(query(collection(db, 'students'), where('classKey', '==', classKey))),
+        classVariants.length > 0
+          ? getDocs(query(collection(db, 'students'), where('className', 'in', classVariants)))
+          : Promise.resolve(null as any)
+      ]);
+      const collectStale = (snap: any) => {
+        if (!snap) return;
+        snap.forEach((d: any) => {
+          const data = d.data() as any;
+          const dNormCode = normalizeStudentCode(data?.studentCode || data?.code || d.id);
+          const isKept = validDocIds.has(d.id) || (dNormCode && validNormCodes.has(dNormCode));
+          if (!isKept) {
+            staleDocIds.add(d.id);
+          }
+        });
+      };
+      collectStale(qKeySnap);
+      collectStale(qNameSnap);
+
+      const staleList = Array.from(staleDocIds);
+      for (let i = 0; i < staleList.length; i += 400) {
+        const chunk = staleList.slice(i, i + 400);
+        const delBatch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+        chunk.forEach((id) => delBatch.delete(doc(db, 'students', id)));
+        await delBatch.commit();
+      }
+    } catch (staleErr) {
+      console.warn('Stale students cleanup warning:', staleErr);
+    }
+
     if (cleaned.length > 0) {
       const CHUNK_SIZE = 400;
       for (let i = 0; i < cleaned.length; i += CHUNK_SIZE) {
@@ -963,7 +1187,10 @@ export async function syncClassStudentsToFirestore(
       }
     }
 
-    // 3. Ensure 'classes' collection document exists & matches totalStudents without overwriting homeroomTeacher/room
+    // 3. Synchronize 'public_rosters' collection (write clean roster or 0 students)
+    await syncPublicRosterToFirestore(stdName, cleaned as StudentRecord[]).catch(() => {});
+
+    // 4. Ensure 'classes' collection document exists & matches totalStudents without overwriting homeroomTeacher/room
     const classSummaryRef = doc(db, 'classes', safeClassKey);
     await trackedSetDoc(
       classSummaryRef,
@@ -978,6 +1205,10 @@ export async function syncClassStudentsToFirestore(
       { merge: true },
       { isUserInitiated: true, actionType: 'admin_batch' }
     );
+
+    // 5. Clear IndexedDB & memory tracking cache so stale student rosters are never served
+    clearMemoryTrackingData();
+    await clearIndexedDBTrackingData().catch(() => {});
 
     return { success: true, syncedStudentsCount: cleaned.length };
   } catch (err: any) {
@@ -1093,30 +1324,88 @@ export async function syncAllLocalRostersToFirestoreIfMissing(
 }
 
 /**
- * Fetch students of a class from Firestore
+ * Fetch students of a class from Firestore (STRICTLY READ-ONLY on Firestore; checks variant keys as fallback)
  */
 export async function fetchClassStudentsFromFirestore(className: string): Promise<StudentRecord[] | null> {
   try {
     if (!db) return null;
+    const classKey = normalizeClassKey(className);
+    if (!classKey) return null;
+    const stdName = `Lớp ${classKey}`;
+
     await ensureFirebaseAuthSession();
 
-    const classKey = normalizeClassKey(className);
-    let rosterRef = doc(db, 'class_rosters', classKey);
-    let docSnap = await getDoc(rosterRef);
+    const variantDocIds = Array.from(
+      new Set([
+        classKey,
+        classKey.toLowerCase(),
+        stdName,
+        `LỚP ${classKey}`,
+        `lớp ${classKey.toLowerCase()}`
+      ])
+    );
 
-    if (!docSnap.exists() && classKey !== classKey.toLowerCase()) {
-      rosterRef = doc(db, 'class_rosters', classKey.toLowerCase());
-      docSnap = await getDoc(rosterRef);
+    const collected: StudentRecord[] = [];
+
+    for (const docId of variantDocIds) {
+      try {
+        const docSnap = await getDoc(doc(db, 'class_rosters', docId));
+        if (docSnap.exists()) {
+          const data = docSnap.data() as any;
+          const rawArr = Array.isArray(data?.students)
+            ? data.students
+            : (Array.isArray(data?.studentList) ? data.studentList : (Array.isArray(data?.roster) ? data.roster : []));
+          if (Array.isArray(rawArr) && rawArr.length > 0) {
+            collected.push(...(rawArr as StudentRecord[]));
+            break; // Prefer canonical key first if populated
+          }
+        }
+      } catch {}
     }
 
-    if (docSnap.exists()) {
-      const data = docSnap.data();
-      if (Array.isArray(data?.students) && data.students.length > 0) {
-        const cleaned = deduplicateAndNormalizeStudents(data.students as StudentRecord[], className);
-        // Cache to LocalStorage immediately
-        saveStudentsToLocalStorage(className, cleaned);
-        return cleaned;
+    // Read-only fallback to 'public_rosters' if class_rosters has 0 items
+    if (collected.length === 0) {
+      for (const docId of variantDocIds) {
+        try {
+          const pubSnap = await getDoc(doc(db, 'public_rosters', docId));
+          if (pubSnap.exists()) {
+            const data = pubSnap.data() as any;
+            const rawArr = Array.isArray(data?.students)
+              ? data.students
+              : (Array.isArray(data?.studentList) ? data.studentList : (Array.isArray(data?.roster) ? data.roster : []));
+            if (Array.isArray(rawArr) && rawArr.length > 0) {
+              collected.push(...(rawArr as StudentRecord[]));
+              break;
+            }
+          }
+        } catch {}
       }
+    }
+
+    // Read-only fallback to 'students' collection if class_rosters & public_rosters have 0 items
+    if (collected.length === 0) {
+      try {
+        const variants = getClassKeyLookupVariants(classKey).slice(0, 10);
+        const qByKey = query(collection(db, 'students'), where('classKey', '==', classKey));
+        const keySnap = await getDocs(qByKey);
+        keySnap.forEach((d) => {
+          collected.push({ ...(d.data() as StudentRecord), id: d.id });
+        });
+
+        if (collected.length === 0 && variants.length > 0) {
+          const qByName = query(collection(db, 'students'), where('className', 'in', variants));
+          const nameSnap = await getDocs(qByName);
+          nameSnap.forEach((d) => {
+            collected.push({ ...(d.data() as StudentRecord), id: d.id });
+          });
+        }
+      } catch {}
+    }
+
+    if (collected.length > 0) {
+      const cleaned = deduplicateAndNormalizeStudents(collected, stdName);
+      saveStudentsToLocalStorage(stdName, cleaned);
+      return cleaned;
     }
   } catch (err) {
     console.warn('Không thể đọc dữ liệu học sinh từ Firestore (sử dụng offline cache):', err);
@@ -1142,30 +1431,37 @@ export async function fetchAllStudentsFromFirestore(userProfile?: UserPermission
       return {};
     }
 
-    // 1. Fetch documents from 'class_rosters' collection (filtered via where() for teacher)
+    // 1. Fetch documents from 'class_rosters' collection (prefer canonical uppercase key over variant docs)
     const rostersQuery = isAdminUser
       ? collection(db, 'class_rosters')
       : query(collection(db, 'class_rosters'), where('classKey', 'in', accessibleClasses.slice(0, 30)));
     const rostersSnap = await getDocs(rostersQuery);
+    const hasCanonicalRoster = new Set<string>();
     if (!rostersSnap.empty) {
       rostersSnap.forEach((docSnap) => {
         const data = docSnap.data() as any;
         const rawName = (data.className || data.name || data.classKey || data.id || docSnap.id || '').trim();
         if (rawName) {
           if (!isAdminUser && !canManageClass(userProfile, rawName)) return;
-          const stdName = getStandardClassName(rawName);
-          const upperKey = normalizeClassKey(rawName);
+          const upperKey = normalizeClassKey(rawName) || normalizeClassKey(docSnap.id);
+          if (!upperKey) return;
+          const stdName = `Lớp ${upperKey}`;
           const studentList = Array.isArray(data.students)
             ? data.students
             : (Array.isArray(data.studentList) ? data.studentList : (Array.isArray(data.roster) ? data.roster : []));
 
           if (Array.isArray(studentList) && studentList.length > 0) {
             const cleaned = deduplicateAndNormalizeStudents(studentList as StudentRecord[], stdName);
-            allRosters[stdName] = cleaned;
-            allRosters[upperKey] = cleaned;
-            try {
-              localStorage.setItem(`eduplay_k5_students_${upperKey}`, JSON.stringify(cleaned));
-            } catch {}
+            const isCanonicalDoc = docSnap.id === upperKey;
+            const existing = allRosters[upperKey] || [];
+            if (isCanonicalDoc || (!hasCanonicalRoster.has(upperKey) && cleaned.length >= existing.length)) {
+              if (isCanonicalDoc) hasCanonicalRoster.add(upperKey);
+              allRosters[stdName] = cleaned;
+              allRosters[upperKey] = cleaned;
+              try {
+                localStorage.setItem(`eduplay_k5_students_${upperKey}`, JSON.stringify(cleaned));
+              } catch {}
+            }
           }
         }
       });
@@ -1174,7 +1470,7 @@ export async function fetchAllStudentsFromFirestore(userProfile?: UserPermission
     // 2. If 'students' collection exists with individual docs, fetch (filtered via where() for teacher) and merge
     try {
       const classVariants = Array.from(
-        new Set(accessibleClasses.flatMap((c) => [c, `Lớp ${c}`]).filter(Boolean))
+        new Set(accessibleClasses.flatMap((c) => getClassKeyLookupVariants(c)).filter(Boolean))
       ).slice(0, 30);
       const studentsQuery = isAdminUser
         ? collection(db, 'students')
@@ -1184,9 +1480,10 @@ export async function fetchAllStudentsFromFirestore(userProfile?: UserPermission
         const individualByClass: Record<string, StudentRecord[]> = {};
         studentsSnap.forEach((d) => {
           const sData = d.data() as StudentRecord;
-          const cls = sData.className || (sData as any).class || (sData as any).classId || (sData as any).lop;
+          const cls = sData.className || (sData as any).classKey || (sData as any).class || (sData as any).classId || (sData as any).lop;
           if (cls && (isAdminUser || canManageClass(userProfile, cls))) {
             const stdName = getStandardClassName(cls);
+            if (!stdName) return;
             if (!individualByClass[stdName]) individualByClass[stdName] = [];
             individualByClass[stdName].push({ ...sData, id: d.id });
           }
@@ -1194,18 +1491,18 @@ export async function fetchAllStudentsFromFirestore(userProfile?: UserPermission
 
         Object.entries(individualByClass).forEach(([stdName, stList]) => {
           const upperKey = normalizeClassKey(stdName);
+          if (!upperKey) return;
           const existing = allRosters[stdName] || [];
-          const mergedMap = new Map<string, StudentRecord>();
-          existing.forEach((s) => mergedMap.set(s.id, s));
-          stList.forEach((s) => mergedMap.set(s.id, s));
-          const cleaned = deduplicateAndNormalizeStudents(Array.from(mergedMap.values()), stdName);
+          // Keep existing class_rosters entries as primary; merge individual docs through deduplicateAndNormalizeStudents
+          // which deduplicates by BOTH code and normalized Vietnamese name (preferring <100 & UPPERCASE)
+          const cleaned = deduplicateAndNormalizeStudents([...existing, ...stList], stdName);
           allRosters[stdName] = cleaned;
           allRosters[upperKey] = cleaned;
         });
       }
     } catch {}
 
-    // Save aggregated result to LocalStorage
+    // Save aggregated result to LocalStorage (browser cache only, never Firestore)
     if (Object.keys(allRosters).length > 0 && isAdminUser) {
       saveAllStudentsToLocalStorage(allRosters);
     }
@@ -1217,7 +1514,7 @@ export async function fetchAllStudentsFromFirestore(userProfile?: UserPermission
 }
 
 /**
- * Real-time listener for a class's student roster from Firestore
+ * Real-time listener for a class's student roster from Firestore (read-only)
  */
 export function subscribeToFirestoreClassStudents(
   className: string,
@@ -1226,6 +1523,8 @@ export function subscribeToFirestoreClassStudents(
   if (!db) return () => {};
 
   const classKey = normalizeClassKey(className);
+  if (!classKey) return () => {};
+  const stdName = `Lớp ${classKey}`;
   const rosterRef = doc(db, 'class_rosters', classKey);
 
   const unsubscribe = onSnapshot(
@@ -1233,23 +1532,37 @@ export function subscribeToFirestoreClassStudents(
     async (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
-        if (Array.isArray(data?.students)) {
-          saveStudentsToLocalStorage(className, data.students);
-          onUpdate(data.students as StudentRecord[]);
-        }
-      } else if (classKey !== classKey.toLowerCase()) {
-        // Fallback to lowercase document if uppercase is not created yet
-        try {
-          const lowerSnap = await getDoc(doc(db, 'class_rosters', classKey.toLowerCase()));
-          if (lowerSnap.exists()) {
-            const data = lowerSnap.data();
-            if (Array.isArray(data?.students)) {
-              saveStudentsToLocalStorage(className, data.students);
-              onUpdate(data.students as StudentRecord[]);
-            }
+        const rawArr = Array.isArray(data?.students)
+          ? data.students
+          : (Array.isArray(data?.studentList) ? data.studentList : null);
+          if (Array.isArray(rawArr) && rawArr.length > 0) {
+            const cleaned = deduplicateAndNormalizeStudents(rawArr as StudentRecord[], stdName);
+            saveStudentsToLocalStorage(stdName, cleaned);
+            onUpdate(cleaned);
+            return;
           }
-        } catch {}
-      }
+          // Canonical doc explicitly exists with 0 students: clear local cache & notify
+          if (Array.isArray(rawArr) && rawArr.length === 0) {
+            saveStudentsToLocalStorage(stdName, []);
+            onUpdate([]);
+            return;
+          }
+        }
+        if (classKey !== classKey.toLowerCase()) {
+          // Read-only fallback to lowercase document if uppercase is missing
+          try {
+            const lowerSnap = await getDoc(doc(db, 'class_rosters', classKey.toLowerCase()));
+            if (lowerSnap.exists()) {
+              const data = lowerSnap.data();
+              const rawArr = Array.isArray(data?.students) ? data.students : null;
+              if (Array.isArray(rawArr) && rawArr.length > 0) {
+                const cleaned = deduplicateAndNormalizeStudents(rawArr as StudentRecord[], stdName);
+                saveStudentsToLocalStorage(stdName, cleaned);
+                onUpdate(cleaned);
+              }
+            }
+          } catch {}
+        }
     },
     (error) => {
       console.warn(`Firestore onSnapshot warning for class ${className}:`, error);
@@ -1260,27 +1573,752 @@ export function subscribeToFirestoreClassStudents(
 }
 
 /**
- * Load students with guaranteed persistence (LocalStorage -> Firestore -> Default)
+ * Load students with guaranteed persistence (LocalStorage -> Firestore -> Empty)
  */
 export async function loadStudentsWithPersistence(className: string): Promise<StudentRecord[]> {
   const stdName = getStandardClassName(className);
+  if (!stdName) return [];
 
   // 1. Try local storage first (instant synchronous)
   const localData = getStudentsFromLocalStorage(stdName);
   if (localData && localData.length > 0) {
-    // Attempt background Firestore sync
     fetchClassStudentsFromFirestore(stdName).catch(() => {});
     return localData;
   }
 
   // 2. Try Firestore fetch
-  const firestoreData = await fetchClassStudentsFromFirestore(stdName);
-  if (firestoreData && firestoreData.length > 0) {
-    return firestoreData;
+  const firestoreData = await fetchClassRosterSingleSource(stdName);
+  if (firestoreData.students.length > 0) {
+    return firestoreData.students;
   }
 
-  // 3. If no student records exist in LocalStorage or Firestore, return empty list (no mock fallback)
+  // 3. No mock fallback
   return [];
+}
+
+/**
+ * ============================================================================
+ * SINGLE SOURCE OF TRUTH & ?debug=1 DIAGNOSTICS + SAFE MERGE PROPOSAL
+ * ============================================================================
+ */
+export interface ClassRosterReadResult {
+  classKey: string;
+  className: string;
+  students: StudentRecord[];
+  realCount: number;
+  maleCount: number;
+  femaleCount: number;
+  storedTotalStudents: number | null;
+  hasCountMismatch: boolean;
+  mismatchWarning: string | null;
+  emptyReason: string | null;
+  keysFound: string[];
+  multiKeyWarning: string | null;
+  sources: {
+    firestoreClassRosters: { keys: string[]; count: number; storedTotal: number | null; male?: number; female?: number };
+    firestoreStudentsCollection: { keys: string[]; count: number };
+    localStorage: { keys: string[]; count: number };
+    indexedDB: { note: string; rosterStored: boolean };
+  };
+  loadedFrom: 'firestore' | 'localStorage' | 'empty' | 'error';
+  errorMessage?: string;
+}
+
+export interface ClassDebugComparisonRow {
+  classKey: string;
+  className: string;
+  keysFound: string[];
+  classRostersCount: number;
+  studentsCollectionCount: number;
+  localStorageCount: number;
+  storedTotalStudents: number | null;
+  displayedCount: number;
+  multiKeyWarning: string | null;
+  mismatchWarning: string | null;
+  indexedDbDatabases: string[];
+}
+
+export interface MergeToStandardKeyPreview {
+  classKey: string;
+  className: string;
+  targetDocPath: string;
+  sourceDocIds: string[];
+  mergedCount: number;
+  existingStandardCount: number;
+  studentsPreview: Array<{ stt: number; studentCode: string; name: string }>;
+  fullStudents: StudentRecord[];
+  willPreserveOriginals: boolean;
+  willPreserveOldStt: boolean;
+  batchLimit: number;
+}
+
+/**
+ * Nguồn đọc ĐỒNG BỘ duy nhất dùng chung cho Đăng nhập & Quản lý người dùng.
+ * Sĩ số trả về luôn là `students.length` (không lấy từ `totalStudents` lưu sẵn).
+ */
+export function resolveClassRosterFromMemoryAndCache(
+  className: string,
+  memoryDb?: Record<string, StudentRecord[]> | null
+): {
+  classKey: string;
+  className: string;
+  students: StudentRecord[];
+  realCount: number;
+  maleCount: number;
+  femaleCount: number;
+} {
+  const classKey = normalizeClassKey(className);
+  const stdName = classKey ? `Lớp ${classKey}` : '';
+  if (!classKey || !stdName) {
+    return { classKey: '', className: '', students: [], realCount: 0, maleCount: 0, femaleCount: 0 };
+  }
+
+  let rawList: StudentRecord[] | null = null;
+
+  if (memoryDb && typeof memoryDb === 'object') {
+    const directCandidates = [className, stdName, classKey, classKey.toLowerCase()];
+    for (const k of directCandidates) {
+      if (k && Array.isArray(memoryDb[k]) && memoryDb[k].length > 0) {
+        rawList = memoryDb[k];
+        break;
+      }
+    }
+    if (!rawList) {
+      for (const [k, list] of Object.entries(memoryDb)) {
+        if (normalizeClassKey(k) === classKey && Array.isArray(list) && list.length > 0) {
+          rawList = list;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!rawList) {
+    rawList = getStudentsFromLocalStorage(stdName);
+  }
+
+  const students = rawList ? deduplicateAndNormalizeStudents(rawList, stdName) : [];
+  let maleCount = 0;
+  let femaleCount = 0;
+  students.forEach((s) => {
+    const g = String(s.gender || (s as any).gioiTinh || (s as any).sex || '').trim().toLowerCase();
+    if (g === 'nam' || g === 'male' || g === 'm') maleCount++;
+    else if (g === 'nữ' || g === 'nu' || g === 'female' || g === 'f') femaleCount++;
+  });
+
+  return {
+    classKey,
+    className: stdName,
+    students,
+    realCount: students.length,
+    maleCount,
+    femaleCount
+  };
+}
+
+/**
+ * Nguồn đọc BẤT ĐỒNG BỘ duy nhất (CHỈ ĐỌC, KHÔNG GHI FIRESTORE) cho một lớp:
+ * Quét cả khóa chuẩn + khóa biến thể trong `class_rosters`, `students`, `classes`, `localStorage`,
+ * tính sĩ số thật = `students.length` và phát hiện lệch sĩ số / nguyên nhân rỗng.
+ */
+export async function fetchClassRosterSingleSource(
+  className: string,
+  userProfile?: UserPermissionsProfile | null
+): Promise<ClassRosterReadResult> {
+  const classKey = normalizeClassKey(className);
+  const stdName = classKey ? `Lớp ${classKey}` : '';
+  const emptyBase: ClassRosterReadResult = {
+    classKey,
+    className: stdName,
+    students: [],
+    realCount: 0,
+    maleCount: 0,
+    femaleCount: 0,
+    storedTotalStudents: null,
+    hasCountMismatch: false,
+    mismatchWarning: null,
+    emptyReason: null,
+    keysFound: [],
+    multiKeyWarning: null,
+    sources: {
+      firestoreClassRosters: { keys: [], count: 0, storedTotal: null },
+      firestoreStudentsCollection: { keys: [], count: 0 },
+      localStorage: { keys: [], count: 0 },
+      indexedDB: { note: 'Firestore persistentLocalCache (SDK) — không chứa bảng sĩ số riêng ngoài snapshot Firestore', rosterStored: false }
+    },
+    loadedFrom: 'empty'
+  };
+
+  if (!classKey) {
+    return { ...emptyBase, emptyReason: 'Khóa lớp không hợp lệ hoặc bị trống.' };
+  }
+
+  const keysFoundSet = new Set<string>();
+  const rosterDocKeys: string[] = [];
+  const studentColKeys = new Set<string>();
+  const lsKeysFound: string[] = [];
+  let storedTotalStudents: number | null = null;
+  let storedMale: number | undefined;
+  let storedFemale: number | undefined;
+
+  const rosterStudentsCollected: StudentRecord[] = [];
+  const studentsColCollected: StudentRecord[] = [];
+  let errorMessage: string | undefined;
+
+  // 1. Inspect localStorage variants (read-only)
+  const localStudents = getStudentsFromLocalStorage(stdName) || [];
+  if (typeof window !== 'undefined') {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('eduplay_k5_students_') && k !== EDUPLAY_STUDENTS_DB_KEY) {
+          const suffix = k.replace('eduplay_k5_students_', '');
+          if (normalizeClassKey(suffix) === classKey) {
+            lsKeysFound.push(k);
+            keysFoundSet.add(`localStorage:${suffix}`);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Inspect Firestore (STRICTLY READ-ONLY)
+  if (db) {
+    try {
+      await ensureFirebaseAuthSession();
+      const isAdminUser = !userProfile || isAdmin(userProfile);
+
+      if (isAdminUser) {
+        const rostersSnap = await getDocs(collection(db, 'class_rosters'));
+        rostersSnap.forEach((docSnap) => {
+          const data = docSnap.data() as any;
+          const docNormKey = normalizeClassKey(data?.classKey || data?.className || docSnap.id) || normalizeClassKey(docSnap.id);
+          if (docNormKey !== classKey) return;
+
+          rosterDocKeys.push(docSnap.id);
+          keysFoundSet.add(`class_rosters/${docSnap.id}`);
+
+          if (typeof data?.totalStudents === 'number' && (storedTotalStudents === null || docSnap.id === classKey)) {
+            storedTotalStudents = data.totalStudents;
+            if (typeof data?.male === 'number') storedMale = data.male;
+            if (typeof data?.female === 'number') storedFemale = data.female;
+          }
+
+          const arr = Array.isArray(data?.students)
+            ? data.students
+            : (Array.isArray(data?.studentList) ? data.studentList : (Array.isArray(data?.roster) ? data.roster : []));
+          if (Array.isArray(arr) && arr.length > 0) {
+            rosterStudentsCollected.push(...(arr as StudentRecord[]));
+          }
+        });
+      } else {
+        const variantIds = Array.from(new Set([classKey, classKey.toLowerCase(), stdName, `LỚP ${classKey}`]));
+        for (const docId of variantIds) {
+          try {
+            const snap = await getDoc(doc(db, 'class_rosters', docId));
+            if (snap.exists()) {
+              const data = snap.data() as any;
+              rosterDocKeys.push(snap.id);
+              keysFoundSet.add(`class_rosters/${snap.id}`);
+              if (typeof data?.totalStudents === 'number' && (storedTotalStudents === null || snap.id === classKey)) {
+                storedTotalStudents = data.totalStudents;
+              }
+              const arr = Array.isArray(data?.students)
+                ? data.students
+                : (Array.isArray(data?.studentList) ? data.studentList : []);
+              if (Array.isArray(arr) && arr.length > 0) {
+                rosterStudentsCollected.push(...(arr as StudentRecord[]));
+              }
+            }
+          } catch {}
+        }
+      }
+
+      // Check `public_rosters` (read-only) so keysFound and fallback stay in sync
+      try {
+        const pubSnap = await getDoc(doc(db, 'public_rosters', classKey));
+        if (pubSnap.exists()) {
+          const pData = pubSnap.data() as any;
+          keysFoundSet.add(`public_rosters/${pubSnap.id}`);
+          const pArr = Array.isArray(pData?.students) ? pData.students : [];
+          if (rosterStudentsCollected.length === 0 && pArr.length > 0) {
+            rosterStudentsCollected.push(...(pArr as StudentRecord[]));
+          }
+        }
+      } catch {}
+
+      // Check `classes` doc for stored totalStudents fallback if still null
+      try {
+        const clsSnap = await getDoc(doc(db, 'classes', classKey));
+        if (clsSnap.exists()) {
+          const cData = clsSnap.data() as any;
+          keysFoundSet.add(`classes/${clsSnap.id}`);
+          if (storedTotalStudents === null && typeof cData?.totalStudents === 'number') {
+            storedTotalStudents = cData.totalStudents;
+          }
+        }
+      } catch {}
+
+      // Check `students` collection (read-only)
+      try {
+        const variants = getClassKeyLookupVariants(classKey).slice(0, 10);
+        const qKeySnap = await getDocs(query(collection(db, 'students'), where('classKey', '==', classKey)));
+        qKeySnap.forEach((d) => {
+          const data = d.data() as StudentRecord;
+          studentColKeys.add(String((data as any).classKey || data.className || classKey));
+          keysFoundSet.add(`students(classKey=${(data as any).classKey || classKey})`);
+          studentsColCollected.push({ ...data, id: d.id });
+        });
+        if (studentsColCollected.length === 0 && variants.length > 0) {
+          const qNameSnap = await getDocs(query(collection(db, 'students'), where('className', 'in', variants)));
+          qNameSnap.forEach((d) => {
+            const data = d.data() as StudentRecord;
+            studentColKeys.add(String(data.className || classKey));
+            keysFoundSet.add(`students(className=${data.className || classKey})`);
+            studentsColCollected.push({ ...data, id: d.id });
+          });
+        }
+      } catch {}
+    } catch (err: any) {
+      errorMessage = err?.message || String(err);
+    }
+  } else {
+    errorMessage = 'Chưa khởi tạo kết nối Cloud Firestore.';
+  }
+
+  // Merge cloud sources (prefer class_rosters + students collection), fallback to localStorage
+  const cloudMergedMap = new Map<string, StudentRecord>();
+  rosterStudentsCollected.forEach((s) => {
+    const k = normalizeStudentCode(s.studentCode || s.code) || s.id || `${s.name}`;
+    if (k) cloudMergedMap.set(k, s);
+  });
+  studentsColCollected.forEach((s) => {
+    const k = normalizeStudentCode(s.studentCode || s.code) || s.id || `${s.name}`;
+    if (k && !cloudMergedMap.has(k)) cloudMergedMap.set(k, s);
+  });
+
+  const cloudClean = deduplicateAndNormalizeStudents(Array.from(cloudMergedMap.values()), stdName);
+  const localClean = deduplicateAndNormalizeStudents(localStudents, stdName);
+
+  const finalStudents = cloudClean.length > 0 ? cloudClean : localClean;
+  const loadedFrom: ClassRosterReadResult['loadedFrom'] =
+    cloudClean.length > 0
+      ? 'firestore'
+      : localClean.length > 0
+      ? 'localStorage'
+      : errorMessage
+      ? 'error'
+      : 'empty';
+
+  if (cloudClean.length > 0) {
+    saveStudentsToLocalStorage(stdName, cloudClean);
+  }
+
+  const realCount = finalStudents.length;
+  let maleCount = 0;
+  let femaleCount = 0;
+  finalStudents.forEach((s) => {
+    const g = String(s.gender || (s as any).gioiTinh || (s as any).sex || '').trim().toLowerCase();
+    if (g === 'nam' || g === 'male' || g === 'm') maleCount++;
+    else if (g === 'nữ' || g === 'nu' || g === 'female' || g === 'f') femaleCount++;
+  });
+
+  const hasCountMismatch = storedTotalStudents !== null && storedTotalStudents !== realCount;
+  const mismatchWarning = hasCountMismatch
+    ? `Sĩ số ghi ${storedTotalStudents} nhưng danh sách có ${realCount} học sinh`
+    : null;
+
+  let emptyReason: string | null = null;
+  if (realCount === 0) {
+    if (errorMessage) {
+      emptyReason = `Lỗi truy vấn Firestore: ${errorMessage}`;
+    } else if (typeof window !== 'undefined' && (localStorage.getItem(`eduplay_k5_cleared_${classKey}`) === 'true' || localStorage.getItem(`eduplay_k5_cleared_${classKey.toLowerCase()}`) === 'true')) {
+      emptyReason = `Lớp ${stdName} đã bị đánh dấu xóa danh sách cục bộ (eduplay_k5_cleared_${classKey})`;
+    } else if (storedTotalStudents && storedTotalStudents > 0) {
+      emptyReason = `Tài liệu Firestore ghi sĩ số ${storedTotalStudents} nhưng mảng students rỗng và không có hồ sơ trong collection students`;
+    } else if (rosterDocKeys.length === 0) {
+      emptyReason = `Chưa có tài liệu class_rosters/${classKey} trên Firestore và chưa có dữ liệu trong bộ nhớ trình duyệt`;
+    } else {
+      emptyReason = `Tài liệu class_rosters/${rosterDocKeys.join(', ')} hiện chưa có phần tử học sinh nào`;
+    }
+  }
+
+  const normalizedDistinctRosterIds = new Set(rosterDocKeys);
+  const multiKeyWarning =
+    normalizedDistinctRosterIds.size > 1 || (normalizedDistinctRosterIds.size === 1 && !normalizedDistinctRosterIds.has(classKey))
+      ? `Phát hiện khóa không chuẩn/nhiều khóa cho ${stdName}: ${Array.from(keysFoundSet).join(', ')}`
+      : null;
+
+  return {
+    classKey,
+    className: stdName,
+    students: finalStudents,
+    realCount,
+    maleCount,
+    femaleCount,
+    storedTotalStudents,
+    hasCountMismatch,
+    mismatchWarning,
+    emptyReason,
+    keysFound: Array.from(keysFoundSet),
+    multiKeyWarning,
+    sources: {
+      firestoreClassRosters: {
+        keys: rosterDocKeys,
+        count: deduplicateAndNormalizeStudents(rosterStudentsCollected, stdName).length,
+        storedTotal: storedTotalStudents,
+        male: storedMale,
+        female: storedFemale
+      },
+      firestoreStudentsCollection: {
+        keys: Array.from(studentColKeys),
+        count: deduplicateAndNormalizeStudents(studentsColCollected, stdName).length
+      },
+      localStorage: {
+        keys: lsKeysFound,
+        count: localClean.length
+      },
+      indexedDB: {
+        note: 'Firestore persistentLocalCache (SDK)',
+        rosterStored: false
+      }
+    },
+    loadedFrom,
+    errorMessage
+  };
+}
+
+/**
+ * Quét CHỈ ĐỌC toàn bộ các lớp cho bảng so sánh `?debug=1`.
+ * Hiển thị: khóa tìm thấy, số HS ở mỗi nơi lưu (class_rosters, students, localStorage), số hiển thị thật và cảnh báo.
+ */
+export async function scanAllClassesComparisonForDebug(
+  userProfile?: UserPermissionsProfile | null
+): Promise<ClassDebugComparisonRow[]> {
+  const byClass = new Map<
+    string,
+    {
+      keysFound: Set<string>;
+      rosterStudents: StudentRecord[];
+      studentsCol: StudentRecord[];
+      storedTotalStudents: number | null;
+      rosterDocCount: number;
+    }
+  >();
+
+  const ensureEntry = (key: string) => {
+    if (!byClass.has(key)) {
+      byClass.set(key, {
+        keysFound: new Set<string>(),
+        rosterStudents: [],
+        studentsCol: [],
+        storedTotalStudents: null,
+        rosterDocCount: 0
+      });
+    }
+    return byClass.get(key)!;
+  };
+
+  let indexedDbNames: string[] = [];
+  if (typeof window !== 'undefined' && window.indexedDB && typeof (window.indexedDB as any).databases === 'function') {
+    try {
+      const dbs = await (window.indexedDB as any).databases();
+      if (Array.isArray(dbs)) {
+        indexedDbNames = dbs.map((d: any) => d?.name).filter(Boolean);
+      }
+    } catch {}
+  }
+
+  // Always seed 5C & 5D so they appear even if empty
+  ensureEntry('5C');
+  ensureEntry('5D');
+
+  if (db) {
+    try {
+      await ensureFirebaseAuthSession();
+      const isAdminUser = !userProfile || isAdmin(userProfile);
+
+      if (isAdminUser) {
+        const [classesSnap, rostersSnap, studentsSnap] = await Promise.all([
+          getDocs(collection(db, 'classes')),
+          getDocs(collection(db, 'class_rosters')),
+          getDocs(collection(db, 'students'))
+        ]);
+
+        classesSnap.forEach((d) => {
+          const data = d.data() as any;
+          const k = normalizeClassKey(data?.name || data?.className || d.id) || normalizeClassKey(d.id);
+          if (!k) return;
+          const entry = ensureEntry(k);
+          entry.keysFound.add(`classes/${d.id}`);
+          if (entry.storedTotalStudents === null && typeof data?.totalStudents === 'number') {
+            entry.storedTotalStudents = data.totalStudents;
+          }
+        });
+
+        rostersSnap.forEach((d) => {
+          const data = d.data() as any;
+          const k = normalizeClassKey(data?.classKey || data?.className || d.id) || normalizeClassKey(d.id);
+          if (!k) return;
+          const entry = ensureEntry(k);
+          entry.rosterDocCount += 1;
+          entry.keysFound.add(`class_rosters/${d.id}`);
+          if (typeof data?.totalStudents === 'number' && (entry.storedTotalStudents === null || d.id === k)) {
+            entry.storedTotalStudents = data.totalStudents;
+          }
+          const arr = Array.isArray(data?.students)
+            ? data.students
+            : (Array.isArray(data?.studentList) ? data.studentList : []);
+          if (Array.isArray(arr)) {
+            entry.rosterStudents.push(...(arr as StudentRecord[]));
+          }
+        });
+
+        studentsSnap.forEach((d) => {
+          const data = d.data() as any;
+          const rawCls = data?.classKey || data?.className || data?.class || data?.classId || data?.lop;
+          const k = normalizeClassKey(rawCls);
+          if (!k) return;
+          const entry = ensureEntry(k);
+          if (rawCls) entry.keysFound.add(`students:${String(rawCls)}`);
+          entry.studentsCol.push({ ...data, id: d.id });
+        });
+      }
+    } catch (err) {
+      console.warn('Lỗi quét ?debug=1 từ Firestore:', err);
+    }
+  }
+
+  // Scan localStorage
+  if (typeof window !== 'undefined') {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const lsKey = localStorage.key(i);
+        if (lsKey && lsKey.startsWith('eduplay_k5_students_') && lsKey !== EDUPLAY_STUDENTS_DB_KEY) {
+          const suffix = lsKey.replace('eduplay_k5_students_', '');
+          const k = normalizeClassKey(suffix);
+          if (!k) continue;
+          const entry = ensureEntry(k);
+          entry.keysFound.add(`ls:${suffix}`);
+        }
+      }
+      const rawFull = localStorage.getItem(EDUPLAY_STUDENTS_DB_KEY);
+      if (rawFull) {
+        const parsed = JSON.parse(rawFull);
+        if (parsed && typeof parsed === 'object') {
+          Object.keys(parsed).forEach((rawK) => {
+            const k = normalizeClassKey(rawK);
+            if (!k) return;
+            ensureEntry(k).keysFound.add(`ls_db:${rawK}`);
+          });
+        }
+      }
+    } catch {}
+  }
+
+  const rows: ClassDebugComparisonRow[] = [];
+  byClass.forEach((entry, classKey) => {
+    const className = `Lớp ${classKey}`;
+    const rosterCleanCount = deduplicateAndNormalizeStudents(entry.rosterStudents, className).length;
+    const studentsColCleanCount = deduplicateAndNormalizeStudents(entry.studentsCol, className).length;
+    const lsResolved = getStudentsFromLocalStorage(className) || [];
+    const localStorageCount = lsResolved.length;
+
+    const mergedCloud = new Map<string, StudentRecord>();
+    entry.rosterStudents.forEach((s) => {
+      const id = normalizeStudentCode(s.studentCode || s.code) || s.id || s.name;
+      if (id) mergedCloud.set(id, s);
+    });
+    entry.studentsCol.forEach((s) => {
+      const id = normalizeStudentCode(s.studentCode || s.code) || s.id || s.name;
+      if (id && !mergedCloud.has(id)) mergedCloud.set(id, s);
+    });
+    const cloudClean = deduplicateAndNormalizeStudents(Array.from(mergedCloud.values()), className);
+    const displayedCount = cloudClean.length > 0 ? cloudClean.length : localStorageCount;
+
+    const rosterOnlyKeys = Array.from(entry.keysFound).filter((k) => k.startsWith('class_rosters/'));
+    const hasNonCanonicalRosterKey = rosterOnlyKeys.some((k) => k !== `class_rosters/${classKey}`);
+    const multiKeyWarning =
+      rosterOnlyKeys.length > 1 || hasNonCanonicalRosterKey
+        ? `Phát hiện ${rosterOnlyKeys.length} khóa class_rosters (${rosterOnlyKeys.join(', ')})`
+        : null;
+
+    const mismatchWarning =
+      entry.storedTotalStudents !== null && entry.storedTotalStudents !== displayedCount
+        ? `Sĩ số ghi ${entry.storedTotalStudents} nhưng danh sách có ${displayedCount} học sinh`
+        : null;
+
+    rows.push({
+      classKey,
+      className,
+      keysFound: Array.from(entry.keysFound),
+      classRostersCount: rosterCleanCount,
+      studentsCollectionCount: studentsColCleanCount,
+      localStorageCount,
+      storedTotalStudents: entry.storedTotalStudents,
+      displayedCount,
+      multiKeyWarning,
+      mismatchWarning,
+      indexedDbDatabases: indexedDbNames
+    });
+  });
+
+  rows.sort((a, b) => a.classKey.localeCompare(b.classKey, 'vi', { numeric: true }));
+  return rows;
+}
+
+/**
+ * ĐỀ XUẤT KHÔI PHỤC (CHỈ XEM TRƯỚC - KHÔNG TỰ CHẠY):
+ * Gom các biến thể khóa của 1 lớp (vd `5d`, `Lớp 5D`, `students`) về khóa chuẩn `class_rosters/{KEY}`
+ * giữ nguyên bản gốc và giữ nguyên số thứ tự / mã HS cũ.
+ */
+export async function previewMergeClassToStandardKey(
+  classKeyOrName: string
+): Promise<MergeToStandardKeyPreview> {
+  const classKey = normalizeClassKey(classKeyOrName);
+  const className = `Lớp ${classKey}`;
+  if (!db || !classKey) {
+    throw new Error('Firestore chưa sẵn sàng hoặc mã lớp không hợp lệ.');
+  }
+
+  await ensureFirebaseAuthSession();
+  const [rostersSnap, studentsSnap] = await Promise.all([
+    getDocs(collection(db, 'class_rosters')),
+    getDocs(collection(db, 'students'))
+  ]);
+
+  const sourceDocIds: string[] = [];
+  let existingStandardCount = 0;
+  const mergedMap = new Map<string, StudentRecord>();
+
+  rostersSnap.forEach((docSnap) => {
+    const data = docSnap.data() as any;
+    const norm = normalizeClassKey(data?.classKey || data?.className || docSnap.id) || normalizeClassKey(docSnap.id);
+    if (norm !== classKey) return;
+    sourceDocIds.push(`class_rosters/${docSnap.id}`);
+    const arr = Array.isArray(data?.students) ? data.students : (Array.isArray(data?.studentList) ? data.studentList : []);
+    if (docSnap.id === classKey) {
+      existingStandardCount = arr.length;
+    }
+    arr.forEach((s: any) => {
+      const codeKey = normalizeStudentCode(s?.studentCode || s?.code) || String(s?.id || s?.name || '');
+      if (codeKey && !mergedMap.has(codeKey)) {
+        mergedMap.set(codeKey, s as StudentRecord);
+      }
+    });
+  });
+
+  studentsSnap.forEach((docSnap) => {
+    const data = docSnap.data() as any;
+    const norm = normalizeClassKey(data?.classKey || data?.className || data?.class || data?.classId);
+    if (norm !== classKey) return;
+    const codeKey = normalizeStudentCode(data?.studentCode || data?.code) || docSnap.id;
+    if (codeKey && !mergedMap.has(codeKey)) {
+      sourceDocIds.push(`students/${docSnap.id}`);
+      mergedMap.set(codeKey, { ...(data as StudentRecord), id: docSnap.id });
+    }
+  });
+
+  const fullStudents = deduplicateAndNormalizeStudents(Array.from(mergedMap.values()), className);
+  return {
+    classKey,
+    className,
+    targetDocPath: `class_rosters/${classKey}`,
+    sourceDocIds: Array.from(new Set(sourceDocIds)),
+    mergedCount: fullStudents.length,
+    existingStandardCount,
+    studentsPreview: fullStudents.slice(0, 10).map((s) => ({
+      stt: s.stt || 0,
+      studentCode: s.studentCode || s.code || '',
+      name: s.name || s.fullName || ''
+    })),
+    fullStudents,
+    willPreserveOriginals: true,
+    willPreserveOldStt: true,
+    batchLimit: 500
+  };
+}
+
+/**
+ * Thực thi gộp về khóa chuẩn CHỈ KHI Admin xác nhận (writeBatch tối đa 500, không xóa bản gốc, giữ STT cũ).
+ */
+export async function executeMergeClassToStandardKey(
+  preview: MergeToStandardKeyPreview
+): Promise<{ success: boolean; message: string; mergedCount: number }> {
+  if (!db) return { success: false, message: 'Chưa khởi tạo Firestore.', mergedCount: 0 };
+  if (!preview || preview.fullStudents.length === 0) {
+    return { success: false, message: 'Không có học sinh nào để gộp.', mergedCount: 0 };
+  }
+
+  try {
+    await ensureFirebaseAuthSession();
+    const nowIso = new Date().toISOString();
+    const male = preview.fullStudents.filter((s) => s.gender === 'Nam').length;
+    const female = preview.fullStudents.filter((s) => s.gender === 'Nữ').length;
+    const safeClassKey = sanitizeFirestoreDocId(preview.classKey, preview.classKey);
+
+    const CHUNK_SIZE = 499; // writeBatch tối đa 500 ops (1 roster doc + <=499 student docs)
+    const firstChunk = preview.fullStudents.slice(0, CHUNK_SIZE);
+    const firstBatch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+    firstBatch.set(
+      doc(db, 'class_rosters', safeClassKey),
+      sanitizeForFirestore({
+        classKey: preview.classKey,
+        className: preview.className,
+        grade: 'Khối 5',
+        totalStudents: preview.fullStudents.length,
+        male,
+        female,
+        students: preview.fullStudents,
+        mergedFromSources: preview.sourceDocIds,
+        updatedAt: nowIso
+      }),
+      { merge: true }
+    );
+    firstChunk.forEach((st) => {
+      const docId = sanitizeFirestoreDocId(st.studentCode || st.code || st.id, `st_${safeClassKey}`);
+      firstBatch.set(
+        doc(db, 'students', docId),
+        sanitizeForFirestore({
+          ...st,
+          classKey: preview.classKey,
+          className: preview.className,
+          updatedAt: nowIso
+        }),
+        { merge: true }
+      );
+    });
+    await firstBatch.commit();
+
+    for (let i = CHUNK_SIZE; i < preview.fullStudents.length; i += 500) {
+      const chunk = preview.fullStudents.slice(i, i + 500);
+      const batch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+      chunk.forEach((st) => {
+        const docId = sanitizeFirestoreDocId(st.studentCode || st.code || st.id, `st_${safeClassKey}`);
+        batch.set(
+          doc(db, 'students', docId),
+          sanitizeForFirestore({
+            ...st,
+            classKey: preview.classKey,
+            className: preview.className,
+            updatedAt: nowIso
+          }),
+          { merge: true }
+        );
+      });
+      await batch.commit();
+    }
+
+    saveStudentsToLocalStorage(preview.className, preview.fullStudents);
+    return {
+      success: true,
+      message: `Đã gộp ${preview.fullStudents.length} học sinh về khóa chuẩn ${preview.targetDocPath} (giữ nguyên bản gốc & STT cũ).`,
+      mergedCount: preview.fullStudents.length
+    };
+  } catch (err: any) {
+    const details = extractFirestoreErrorDetails(err);
+    return { success: false, message: details.message, mergedCount: 0 };
+  }
 }
 
 /**

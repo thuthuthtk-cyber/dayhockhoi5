@@ -57,6 +57,12 @@ import {
   ClassDuplicateScanResult,
   ClassDuplicatePreviewRow
 } from '../../services/classDedupService';
+import {
+  inspectClassStudentDuplicatesAcrossStores,
+  executeConfirmedOldDuplicateCleanup,
+  ClassStudentDuplicateAuditReport,
+  SynchronizedCleanupResult
+} from '../../services/studentDuplicateCleanupService';
 import { formatScore } from '../../utils/scoreUtils';
 import { groupAndCountErrors, extractFirestoreErrorDetails } from '../../services/firestoreWriteTracker';
 import {
@@ -66,7 +72,13 @@ import {
   parseStudentExcel,
   STANDARD_STUDENT_HEADERS
 } from '../../services/excelService';
-import { normalizeStudentCode, normalizeStudentName } from '../../services/studentCode';
+import {
+  normalizeStudentCode,
+  normalizeStudentName,
+  formatStandardStudentCode,
+  preserveRawStudentCode,
+  parseStudentCode
+} from '../../services/studentCode';
 import {
   renameStudentCodeAcrossSystem,
   scanForMismatchedSubmissions,
@@ -92,6 +104,12 @@ import {
   sortStudentsDescending,
   sortStudentsAscending,
   deduplicateAndNormalizeStudents,
+  resolveClassRosterFromMemoryAndCache,
+  fetchClassRosterSingleSource,
+  ClassRosterReadResult,
+  previewMergeClassToStandardKey,
+  executeMergeClassToStandardKey,
+  MergeToStandardKeyPreview,
   getAllStudentEnrollments,
   promoteStudentToNextYear,
   initializeStudentEnrollmentsForYear,
@@ -493,13 +511,12 @@ export const getClassCodePrefix = (className: string): string => {
   return slug.replace(/^lop/, '') || '3a';
 };
 
-// Auto-generate Student ID according to rule: {tên_lớp_viết_thường_không_dấu_khoảng_trắng}{stt}
+// Auto-generate Student ID according to unified convention without leading zero: e.g. 5D26-27-1
 export const generateStudentCode = (className: string, stt: number): string => {
-  const prefix = getClassCodePrefix(className);
-  return `${prefix}${stt}`;
+  return formatStandardStudentCode(undefined, className, stt);
 };
 
-// Re-index STT and regenerate Student Code for a class roster with deduplication and unique keys
+// Normalize without renumbering existing STT or changing stored codes
 export const reindexClassStudents = (students: StudentRecord[], className: string): StudentRecord[] => {
   return deduplicateAndNormalizeStudents(students, className);
 };
@@ -733,6 +750,24 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     return getAllStudentsFromLocalStorage();
   });
   const [isStudentsLoading, setIsStudentsLoading] = useState<boolean>(true);
+  const [classDiagnostic, setClassDiagnostic] = useState<ClassRosterReadResult | null>(null);
+  const [isLoadingClassDiagnostic, setIsLoadingClassDiagnostic] = useState<boolean>(false);
+  const [classReloadTick, setClassReloadTick] = useState<number>(0);
+  const [reimportPreviewModal, setReimportPreviewModal] = useState<{
+    isOpen: boolean;
+    diagnostic: ClassRosterReadResult | null;
+    mergePreview: MergeToStandardKeyPreview | null;
+    isLoadingMerge: boolean;
+    isExecutingMerge: boolean;
+    error: string | null;
+  }>({
+    isOpen: false,
+    diagnostic: null,
+    mergePreview: null,
+    isLoadingMerge: false,
+    isExecutingMerge: false,
+    error: null
+  });
 
   const handleSyncLocalRostersToCloud = useCallback(async (showFeedback = false) => {
     if (!db) return;
@@ -780,10 +815,8 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       setIsStudentsLoading(false);
     }
 
-    // Tự động đẩy danh sách lớp & học sinh đang có trong LocalStorage lên Firestore (dayhockhoi5) nếu cloud chưa có
-    handleSyncLocalRostersToCloud(false).catch(() => {});
-
-    // Proactively fetch all class rosters in parallel from Firestore to prevent timing issues
+    // CHỈ ĐỌC khi mở màn hình / F5 (tuyệt đối không tự ghi Firestore khi tải trang)
+    // Proactively fetch all class rosters in parallel from Firestore (read-only)
     fetchAllStudentsFromFirestore(activeTeacherProfile)
       .then((remoteDb) => {
         if (remoteDb && Object.keys(remoteDb).length > 0) {
@@ -854,11 +887,12 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         (err) => console.warn('Error listening to classes in Firestore:', err)
       );
 
-      // 2. Real-time listener for 'class_rosters' collection (robust dual-key normalization, prevent empty duplicate docs from overwriting populated rosters)
+      // 2. Real-time listener for 'class_rosters' collection (strict canonical key precedence, never let stale variant docs override canonical doc)
       unsubRosters = onSnapshot(
         collection(db, 'class_rosters'),
         (snapshot) => {
           const cloudRosters: Record<string, StudentRecord[]> = {};
+          const hasCanonicalRoster = new Set<string>();
           if (!snapshot.empty) {
             snapshot.forEach((docSnap) => {
               const data = docSnap.data();
@@ -872,8 +906,16 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                   : (Array.isArray(data.studentList) ? data.studentList : (Array.isArray(data.roster) ? data.roster : []));
                 if (Array.isArray(studentList)) {
                   const cleaned = deduplicateAndNormalizeStudents(studentList as StudentRecord[], stdName);
+                  const isCanonicalDoc = docSnap.id === upperKey;
                   const existingForKey = cloudRosters[upperKey];
-                  if (existingForKey === undefined || (existingForKey.length === 0 && cleaned.length > 0) || cleaned.length > existingForKey.length) {
+                  if (
+                    isCanonicalDoc ||
+                    (!hasCanonicalRoster.has(upperKey) &&
+                      (existingForKey === undefined ||
+                        (existingForKey.length === 0 && cleaned.length > 0) ||
+                        cleaned.length > existingForKey.length))
+                  ) {
+                    if (isCanonicalDoc) hasCanonicalRoster.add(upperKey);
                     cloudRosters[stdName] = cleaned;
                     cloudRosters[upperKey] = cleaned;
                   }
@@ -896,7 +938,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         }
       );
 
-      // 3. Real-time listener for 'students' collection (if individual student docs exist)
+      // 3. Real-time listener for 'students' collection (deduplicate strictly by BOTH code and normalized Vietnamese name, preferring canonical <100)
       unsubStudents = onSnapshot(
         collection(db, 'students'),
         (snapshot) => {
@@ -904,9 +946,10 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
             const individualStudentsByClass: Record<string, StudentRecord[]> = {};
             snapshot.forEach((docSnap) => {
               const data = docSnap.data() as StudentRecord;
-              const cls = data.className || (data as any).class || (data as any).classId || (data as any).lop;
+              const cls = data.className || (data as any).classKey || (data as any).class || (data as any).classId || (data as any).lop;
               if (cls) {
                 const stdName = getStandardClassName(cls);
+                if (!stdName) return;
                 if (!individualStudentsByClass[stdName]) {
                   individualStudentsByClass[stdName] = [];
                 }
@@ -921,11 +964,16 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                 const updated = { ...prev };
                 Object.entries(individualStudentsByClass).forEach(([cName, stList]) => {
                   const upperKey = normalizeClassKey(cName);
-                  const existing = updated[cName] || [];
-                  const mergedMap = new Map<string, StudentRecord>();
-                  existing.forEach((s) => mergedMap.set(s.id, s));
-                  stList.forEach((s) => mergedMap.set(s.id, s));
-                  const cleaned = deduplicateAndNormalizeStudents(Array.from(mergedMap.values()), cName);
+                  if (!upperKey) return;
+                  if (
+                    typeof window !== 'undefined' &&
+                    (localStorage.getItem(`eduplay_k5_cleared_${upperKey}`) === 'true' ||
+                      localStorage.getItem(`eduplay_k5_cleared_${upperKey.toLowerCase()}`) === 'true')
+                  ) {
+                    return;
+                  }
+                  const existing = updated[cName] || updated[upperKey] || [];
+                  const cleaned = deduplicateAndNormalizeStudents([...existing, ...stList], cName);
                   updated[cName] = cleaned;
                   updated[upperKey] = cleaned;
                 });
@@ -959,42 +1007,81 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     };
   }, []);
 
-  // 2. Class Selection Sync: When user selects a class, fetch from Firestore if empty in state
+  // 2. Class Selection Sync (STRICTLY READ-ONLY on Firestore): dùng cùng Nguồn duy nhất & phát hiện lệch sĩ số
   useEffect(() => {
-    if (!selectedClass) return;
+    if (!selectedClass) {
+      setClassDiagnostic(null);
+      return;
+    }
 
-    const currentRoster = studentDatabase[selectedClass];
-    if (!currentRoster || currentRoster.length === 0) {
-      const cached = getStudentsFromLocalStorage(selectedClass);
-      if (cached && cached.length > 0) {
-        setStudentDatabase((prev) => ({
-          ...prev,
-          [selectedClass]: cached
-        }));
-      } else {
-        // Try fetching from Firestore first to preserve any imported data
-        fetchClassStudentsFromFirestore(selectedClass).then((firestoreStudents) => {
-          if (firestoreStudents && firestoreStudents.length > 0) {
-            setStudentDatabase((prev) => ({
-              ...prev,
-              [selectedClass]: firestoreStudents
-            }));
-          } else {
-            setStudentDatabase((prev) => ({
-              ...prev,
-              [selectedClass]: []
-            }));
-            saveStudentsToLocalStorage(selectedClass, []);
-          }
-        }).catch(() => {
+    let isMounted = true;
+    const stdName = getStandardClassName(selectedClass);
+    const classKey = normalizeClassKey(selectedClass);
+    const cached = resolveClassRosterFromMemoryAndCache(selectedClass, studentDatabase);
+
+    if (cached.realCount > 0) {
+      setStudentDatabase((prev) => ({
+        ...prev,
+        [selectedClass]: cached.students,
+        ...(stdName ? { [stdName]: cached.students } : {}),
+        ...(classKey ? { [classKey]: cached.students } : {})
+      }));
+    }
+
+    setIsLoadingClassDiagnostic(true);
+    fetchClassRosterSingleSource(selectedClass, activeTeacherProfile)
+      .then((result) => {
+        if (!isMounted) return;
+        setClassDiagnostic(result);
+        setIsLoadingClassDiagnostic(false);
+        if (result.realCount > 0) {
           setStudentDatabase((prev) => ({
             ...prev,
-            [selectedClass]: []
+            [selectedClass]: result.students,
+            ...(stdName ? { [stdName]: result.students } : {}),
+            ...(classKey ? { [classKey]: result.students } : {})
           }));
-        });
-      }
-    }
-  }, [selectedClass]);
+        } else if (cached.realCount === 0) {
+          setStudentDatabase((prev) => ({
+            ...prev,
+            [selectedClass]: [],
+            ...(stdName ? { [stdName]: [] } : {}),
+            ...(classKey ? { [classKey]: [] } : {})
+          }));
+        }
+      })
+      .catch((err) => {
+        if (!isMounted) return;
+        setIsLoadingClassDiagnostic(false);
+        setClassDiagnostic((prev) => ({
+          ...(prev || {
+            classKey,
+            className: stdName,
+            students: cached.students,
+            realCount: cached.realCount,
+            maleCount: cached.maleCount,
+            femaleCount: cached.femaleCount,
+            storedTotalStudents: null,
+            hasCountMismatch: false,
+            mismatchWarning: null,
+            keysFound: [],
+            multiKeyWarning: null,
+            sources: {
+              firestoreClassRosters: { keys: [], count: 0, storedTotal: null },
+              firestoreStudentsCollection: { keys: [], count: 0 },
+              localStorage: { keys: [], count: cached.realCount },
+              indexedDB: { note: 'Firestore persistentLocalCache (SDK)', rosterStored: false }
+            },
+            loadedFrom: 'error' as const
+          }),
+          emptyReason: cached.realCount === 0 ? `Lỗi truy vấn Firestore: ${err?.message || String(err)}` : null
+        }));
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedClass, classReloadTick, activeTeacherProfile]);
 
   // Student search & filter & sort state (Default to Alphabetical A-Z by Student Name)
   const [studentSearch, setStudentSearch] = useState('');
@@ -1156,6 +1243,80 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     }
   };
 
+  // Admin Student Duplicate Audit & Synchronized Cleanup Modal State (Steps 1-5)
+  const [isStudentDedupModalOpen, setIsStudentDedupModalOpen] = useState(false);
+  const [studentDedupTargetClass, setStudentDedupTargetClass] = useState<string>('Lớp 5D');
+  const [isInspectingStudentDedup, setIsInspectingStudentDedup] = useState(false);
+  const [studentDedupReport, setStudentDedupReport] = useState<ClassStudentDuplicateAuditReport | null>(null);
+  const [studentDedupResult, setStudentDedupResult] = useState<SynchronizedCleanupResult | null>(null);
+  const [isExecutingStudentDedup, setIsExecutingStudentDedup] = useState(false);
+  const [studentDedupError, setStudentDedupError] = useState<string | null>(null);
+
+  const handleOpenStudentDedupModal = async (targetClassName?: string) => {
+    const resolvedTarget = targetClassName || selectedClass || 'Lớp 5D';
+    setStudentDedupTargetClass(resolvedTarget);
+    setIsStudentDedupModalOpen(true);
+    setIsInspectingStudentDedup(true);
+    setStudentDedupError(null);
+    setStudentDedupResult(null);
+    try {
+      const report = await inspectClassStudentDuplicatesAcrossStores(resolvedTarget);
+      setStudentDedupReport(report);
+    } catch (err: any) {
+      setStudentDedupError(err?.message || 'Không thể kiểm tra danh sách học sinh trùng.');
+    } finally {
+      setIsInspectingStudentDedup(false);
+    }
+  };
+
+  const handleConfirmExecuteOldStudentCleanup = async () => {
+    if (!studentDedupReport || isExecutingStudentDedup) return;
+    setIsExecutingStudentDedup(true);
+    setStudentDedupError(null);
+    try {
+      const res = await executeConfirmedOldDuplicateCleanup(studentDedupReport);
+      setStudentDedupResult(res);
+      setStudentDedupReport(res.afterReport);
+
+      const cleanList = res.afterReport.rawCanonicalKeepStudents;
+      const stdName = res.afterReport.className;
+      const cKey = res.afterReport.classKey;
+
+      setStudentDatabase((prev) => {
+        const nextDb = { ...prev };
+        Object.keys(nextDb).forEach((k) => {
+          if (normalizeClassKey(k) === cKey && k !== stdName && k !== cKey && k !== selectedClass) {
+            delete nextDb[k];
+          }
+        });
+        nextDb[stdName] = cleanList;
+        nextDb[cKey] = cleanList;
+        if (selectedClass && normalizeClassKey(selectedClass) === cKey) {
+          nextDb[selectedClass] = cleanList;
+        }
+        return nextDb;
+      });
+      setClassReloadTick((t) => t + 1);
+
+      if (res.success) {
+        showToast(
+          `✅ Đã dọn ${res.deletedOldCount} bản cũ đồng bộ trên mọi nơi! Giữ nguyên ${res.keptCount} học sinh bản mới (< 100).`,
+          'success'
+        );
+      } else {
+        const msg = res.errors.join('; ') || 'Có lỗi khi đồng bộ xóa trên một số kho.';
+        setStudentDedupError(msg);
+        showToast(`⚠️ Đã xử lý nhưng có cảnh báo: ${msg}`, 'error');
+      }
+    } catch (err: any) {
+      const msg = err?.message || 'Lỗi khi xóa bản cũ đồng bộ.';
+      setStudentDedupError(msg);
+      showToast(msg, 'error');
+    } finally {
+      setIsExecutingStudentDedup(false);
+    }
+  };
+
   const handleConfirmClearAllStudents = async () => {
     if (!selectedClass) {
       setIsConfirmClearAllStudentsOpen(false);
@@ -1172,33 +1333,15 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       const stdName = getStandardClassName(selectedClass);
       const classKey = normalizeClassKey(selectedClass);
 
-      // 1. Clear via studentStorageService helper (sets cleared flag & empty array)
+      // 1. Clear localStorage variants + IndexedDB + memory tracking cache
       const res = clearAllStudentsInClass(selectedClass);
 
-      // 2. Proactively update Firestore class_rosters document with empty students list
+      // 2. Synchronize empty list across ALL Firestore collections (`class_rosters`, `public_rosters`, `students`, `classes`)
       let cloudClearErr: string | null = null;
       if (db) {
-        try {
-          const authStatus = await ensureFirebaseAuthSessionWithStatus();
-          if (!auth?.currentUser && authStatus.errorCode) {
-            cloudClearErr = authStatus.errorMessage || 'Lỗi xác thực Firebase Auth.';
-          } else {
-            const safeClassKey = sanitizeFirestoreDocId(classKey, '5C');
-            const rosterRef = doc(db, 'class_rosters', safeClassKey);
-            await trackedSetDoc(rosterRef, sanitizeForFirestore({
-              className: stdName,
-              classKey,
-              totalStudents: 0,
-              male: 0,
-              female: 0,
-              students: [],
-              updatedAt: new Date().toISOString()
-            }), { merge: true }, { isUserInitiated: true, actionType: 'admin_batch' });
-          }
-        } catch (fbErr: any) {
-          const details = extractFirestoreErrorDetails(fbErr);
-          cloudClearErr = details.message;
-          console.warn('Firestore clear roster doc warning:', details.message);
+        const syncRes = await syncClassStudentsToFirestore(stdName, []);
+        if (!syncRes.success && syncRes.error) {
+          cloudClearErr = syncRes.error;
         }
       }
 
@@ -1210,13 +1353,14 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         nextDb[classKey] = [];
         return nextDb;
       });
+      setClassReloadTick((t) => t + 1);
 
       if (cloudClearErr) {
         setFirestoreSyncError(cloudClearErr);
         showToast(`Đã xóa trên máy nhưng lỗi đồng bộ Firestore: ${cloudClearErr}`, 'error');
       } else if (res.success) {
         setFirestoreSyncError(null);
-        showToast(`Đã xóa sạch toàn bộ học sinh lớp ${selectedClass} thành công! Sĩ số hiện tại: 0 học sinh.`, 'success');
+        showToast(`Đã xóa sạch toàn bộ học sinh lớp ${selectedClass} trên mọi nơi lưu! Sĩ số hiện tại: 0 học sinh.`, 'success');
       } else {
         showToast(`Đã xóa sạch học sinh lớp ${selectedClass} trong bộ nhớ tạm.`, 'success');
       }
@@ -1296,20 +1440,24 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
     const studentsToImport = reindexClassStudents(
       parsedStudentsBatch.map((s) => {
-        const normCode = normalizeStudentCode(s.studentCode || s.code);
+        const preservedCode = preserveRawStudentCode(s.studentCode || s.code);
         return {
           ...s,
-          code: normCode || s.code,
-          studentCode: normCode || s.code,
+          code: preservedCode || s.code,
+          studentCode: preservedCode || s.code,
           className: selectedClass
         };
       }),
       selectedClass
     );
 
+    const stdImportName = getStandardClassName(selectedClass);
+    const importKey = normalizeClassKey(selectedClass);
     const updatedDb = {
       ...studentDatabase,
-      [selectedClass]: studentsToImport
+      [selectedClass]: studentsToImport,
+      ...(stdImportName ? { [stdImportName]: studentsToImport } : {}),
+      ...(importKey ? { [importKey]: studentsToImport } : {})
     };
     setStudentDatabase(updatedDb);
 
@@ -1324,6 +1472,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     const res = await syncClassStudentsToFirestore(selectedClass, studentsToImport);
     if (res.success) {
       setFirestoreSyncError(null);
+      setClassReloadTick((t) => t + 1);
       showToast(
         `🎉 Đã nạp & đồng bộ ${studentsToImport.length} học sinh lớp ${selectedClass} lên Cloud Firestore (class_rosters & students) thành công!`,
         'success'
@@ -1338,7 +1487,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   // Export Student Credentials (Tải danh sách TK & MK cho Phụ huynh dạng .xlsx chuẩn 9 cột)
   const handleDownloadCredentialsList = () => {
     const clsName = selectedClass || 'Lớp 5C';
-    const studentsToExport = studentDatabase[clsName] || [];
+    const studentsToExport = resolveClassRosterFromMemoryAndCache(clsName, studentDatabase).students;
     exportStudentCredentialsExcel(clsName, studentsToExport);
 
     setToastMessage(`✅ Đã xuất danh sách tài khoản & mật khẩu lớp ${clsName} (định dạng Excel .xlsx 9 cột chuẩn) thành công!`);
@@ -1465,8 +1614,13 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
   const handleOpenAddStudentModal = () => {
     if (!selectedClass) return;
-    const currentList = studentDatabase[selectedClass] || [];
-    const nextStt = currentList.length + 1;
+    const currentList = resolveClassRosterFromMemoryAndCache(selectedClass, studentDatabase).students;
+    const maxExistingStt = currentList.reduce((max, s) => {
+      const parsed = parseStudentCode(s.studentCode || s.code);
+      const sttVal = typeof s.stt === 'number' && s.stt > 0 ? s.stt : (parsed?.stt || 0);
+      return sttVal > max ? sttVal : max;
+    }, 0);
+    const nextStt = maxExistingStt + 1;
     const defaultCode = generateStudentCode(selectedClass, nextStt);
     setAddForm({
       code: defaultCode,
@@ -1531,8 +1685,8 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       return;
     }
 
-    const currentList = studentDatabase[selectedClass] || [];
-    const updatedList = currentList.map((st) => {
+    const currentList = resolveClassRosterFromMemoryAndCache(selectedClass, studentDatabase).students;
+    const rawUpdatedList = currentList.map((st) => {
       if (st.id === editingStudent.id) {
         return {
           ...st,
@@ -1554,10 +1708,15 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       }
       return st;
     });
+    const updatedList = deduplicateAndNormalizeStudents(rawUpdatedList, selectedClass);
+    const stdEditName = getStandardClassName(selectedClass);
+    const editClassKey = normalizeClassKey(selectedClass);
 
     const updatedDb = {
       ...studentDatabase,
-      [selectedClass]: updatedList
+      [selectedClass]: updatedList,
+      ...(stdEditName ? { [stdEditName]: updatedList } : {}),
+      ...(editClassKey ? { [editClassKey]: updatedList } : {})
     };
     try {
       setStudentDatabase(updatedDb);
@@ -1732,33 +1891,39 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-  // Add student to current class
+  // Add student to current class (assign STT once without renumbering existing students)
   const handleAddStudentToClass = async () => {
     if (!selectedClass || !addForm.name.trim()) {
       showToast('⚠️ Vui lòng nhập họ và tên học sinh!', 'error');
       return;
     }
 
-    const currentList = studentDatabase[selectedClass] || [];
-    const nextStt = currentList.length + 1;
+    const currentList = resolveClassRosterFromMemoryAndCache(selectedClass, studentDatabase).students;
+    const maxExistingStt = currentList.reduce((max, s) => {
+      const parsed = parseStudentCode(s.studentCode || s.code);
+      const sttVal = typeof s.stt === 'number' && s.stt > 0 ? s.stt : (parsed?.stt || 0);
+      return sttVal > max ? sttVal : max;
+    }, 0);
+    const nextStt = maxExistingStt + 1;
     const rawCode = addForm.code.trim() || generateStudentCode(selectedClass, nextStt);
-    const normCode = normalizeStudentCode(rawCode);
+    const storedCode = preserveRawStudentCode(rawCode);
+    const normCode = normalizeStudentCode(storedCode);
 
-    // Kiểm tra tính duy nhất của Mã học sinh trên toàn hệ thống
+    // Kiểm tra tính duy nhất của Mã học sinh trên toàn hệ thống (khớp cả dạng có số 0 và không số 0)
     const isDuplicate = Object.values(studentDatabase).some(clsList =>
-      Array.isArray(clsList) && clsList.some(st => normalizeStudentCode(st.code) === normCode)
+      Array.isArray(clsList) && clsList.some(st => normalizeStudentCode(st.studentCode || st.code) === normCode)
     );
     if (isDuplicate) {
-      showToast(`⚠️ Mã học sinh "${normCode}" đã tồn tại trong hệ thống! Vui lòng nhập mã học sinh khác.`, 'error');
+      showToast(`⚠️ Mã học sinh "${storedCode}" đã tồn tại trong hệ thống! Vui lòng nhập mã học sinh khác.`, 'error');
       return;
     }
 
     const newStudent: StudentRecord = {
       id: `std-${Date.now()}`,
       stt: nextStt,
-      code: normCode,
-      studentCode: normCode,
-      username: normCode,
+      code: storedCode,
+      studentCode: storedCode,
+      username: storedCode,
       pin: addForm.pin || '123456',
       sddcn: addForm.sddcn.trim(),
       name: addForm.name.trim(),
@@ -1779,9 +1944,13 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
     const updatedList = reindexClassStudents([...currentList, newStudent], selectedClass);
 
+    const stdAddName = getStandardClassName(selectedClass);
+    const addKey = normalizeClassKey(selectedClass);
     const updatedDb = {
       ...studentDatabase,
-      [selectedClass]: updatedList
+      [selectedClass]: updatedList,
+      ...(stdAddName ? { [stdAddName]: updatedList } : {}),
+      ...(addKey ? { [addKey]: updatedList } : {})
     };
     setStudentDatabase(updatedDb);
     saveStudentsToLocalStorage(selectedClass, updatedList);
@@ -1821,7 +1990,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     return matchesSearch && matchesGroup && matchesStatus && matchesSubject;
   });
 
-  // Helper to get stats for a class dynamically from studentDatabase with fallback
+  // Helper to get stats for a class dynamically from Single Source of Truth (realList.length)
   const getClassStats = (className: string) => {
     if (!hasYearEnrollments && selectedAcademicYear !== '2026-2027') {
       return { total: 0, male: 0, female: 0 };
@@ -1839,27 +2008,8 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       return { total: list.length, male: Math.ceil(list.length / 2), female: Math.floor(list.length / 2) };
     }
 
-    const stdName = getStandardClassName(className);
-    const key = normalizeClassKey(className);
-    const students =
-      (studentDatabase[className] && studentDatabase[className].length > 0 ? studentDatabase[className] : null) ||
-      (studentDatabase[stdName] && studentDatabase[stdName].length > 0 ? studentDatabase[stdName] : null) ||
-      (studentDatabase[key] && studentDatabase[key].length > 0 ? studentDatabase[key] : null) ||
-      getStudentsFromLocalStorage(stdName) ||
-      getStudentsFromLocalStorage(key) ||
-      getStudentsFromLocalStorage(className) ||
-      [];
-    let male = 0;
-    let female = 0;
-    students.forEach((s) => {
-      const g = (s.gender || (s as any).gioiTinh || (s as any).sex || '').toString().trim().toLowerCase();
-      if (g === 'nam' || g === 'male' || g === 'm') {
-        male++;
-      } else if (g === 'nữ' || g === 'nu' || g === 'female' || g === 'f') {
-        female++;
-      }
-    });
-    return { total: students.length, male, female };
+    const resolved = resolveClassRosterFromMemoryAndCache(className, studentDatabase);
+    return { total: resolved.realCount, male: resolved.maleCount, female: resolved.femaleCount };
   };
 
   // Helper to get stats for a block dynamically from studentDatabase
@@ -2123,21 +2273,11 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   const activeBlockClasses = (hasYearEnrollments || selectedAcademicYear === '2026-2027') ? classesList.filter(isGrade5Class) : [];
   const activeBlockDynamicStats = getBlockStats('Khối 5');
 
-  // Compute total dynamic stats for selected class
+  // Compute total dynamic stats for selected class (Shared Single Source of Truth)
   const currentClassStudents = useMemo(() => {
     if (!selectedClass) return [];
     if (selectedAcademicYear === '2026-2027') {
-      const stdName = getStandardClassName(selectedClass);
-      const key = normalizeClassKey(selectedClass);
-      const list =
-        (studentDatabase[selectedClass] && studentDatabase[selectedClass].length > 0 ? studentDatabase[selectedClass] : null) ||
-        (studentDatabase[stdName] && studentDatabase[stdName].length > 0 ? studentDatabase[stdName] : null) ||
-        (studentDatabase[key] && studentDatabase[key].length > 0 ? studentDatabase[key] : null) ||
-        getStudentsFromLocalStorage(stdName) ||
-        getStudentsFromLocalStorage(key) ||
-        getStudentsFromLocalStorage(selectedClass) ||
-        [];
-      return deduplicateAndNormalizeStudents(list, stdName);
+      return resolveClassRosterFromMemoryAndCache(selectedClass, studentDatabase).students;
     }
     const enrollments = getStudentEnrollmentsForYear(selectedAcademicYear);
     const classStd = getStandardClassName(selectedClass);
@@ -2159,7 +2299,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         sddcn: en.sddcn,
         name: baseStudent?.name || `Học sinh ${en.displayCode}`,
         fullName: baseStudent?.fullName || baseStudent?.name || `Học sinh ${en.displayCode}`,
-        code: en.displayCode || `0${idx + 1}`,
+        code: en.displayCode || `${idx + 1}`,
         className: en.className || selectedClass,
         gender: baseStudent?.gender || 'Nam',
         stt: idx + 1
@@ -2181,15 +2321,48 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
   const filteredClassStudents = useMemo(() => {
     if (studentSortOrder === 'name_asc') {
-      return sortStudentsByNameAZ(rawFilteredStudents);
+      return sortStudentsByNameAZ(rawFilteredStudents, selectedClass || undefined);
     } else if (studentSortOrder === 'name_desc') {
-      return sortStudentsByNameZA(rawFilteredStudents);
+      return sortStudentsByNameZA(rawFilteredStudents, selectedClass || undefined);
     } else if (studentSortOrder === 'code_desc') {
-      return sortStudentsDescending(rawFilteredStudents);
+      return sortStudentsDescending(rawFilteredStudents, selectedClass || undefined);
     } else {
-      return sortStudentsAscending(rawFilteredStudents);
+      return sortStudentsAscending(rawFilteredStudents, selectedClass || undefined);
     }
-  }, [rawFilteredStudents, studentSortOrder]);
+  }, [rawFilteredStudents, selectedClass, studentSortOrder]);
+
+  const handleOpenReimportPreviewModal = async () => {
+    if (!selectedClass) return;
+    setReimportPreviewModal({
+      isOpen: true,
+      diagnostic: classDiagnostic,
+      mergePreview: null,
+      isLoadingMerge: true,
+      isExecutingMerge: false,
+      error: null
+    });
+    try {
+      const [latestDiag, mergePrev] = await Promise.all([
+        fetchClassRosterSingleSource(selectedClass, activeTeacherProfile),
+        previewMergeClassToStandardKey(selectedClass).catch(() => null)
+      ]);
+      setClassDiagnostic(latestDiag);
+      setReimportPreviewModal({
+        isOpen: true,
+        diagnostic: latestDiag,
+        mergePreview: mergePrev,
+        isLoadingMerge: false,
+        isExecutingMerge: false,
+        error: null
+      });
+    } catch (err: any) {
+      setReimportPreviewModal((prev) => ({
+        ...prev,
+        isLoadingMerge: false,
+        error: err?.message || String(err)
+      }));
+    }
+  };
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -2327,13 +2500,23 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                 {userRole !== 'student' && (
                   <div className="flex items-center gap-2.5 flex-wrap">
                     {isSystemAdmin && (
-                      <button
-                        type="button"
-                        onClick={handleOpenDedupTool}
-                        className="px-4 py-2.5 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white transition-all shadow-md flex items-center gap-2 cursor-pointer active:scale-95 whitespace-nowrap"
-                      >
-                        <Database className="w-4 h-4" /> Kiểm tra & Dọn trùng lớp
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleOpenStudentDedupModal('Lớp 5D')}
+                          className="px-4 py-2.5 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white transition-all shadow-md flex items-center gap-2 cursor-pointer active:scale-95 whitespace-nowrap"
+                          title="Kiểm tra & dọn bản ghi học sinh trùng (bản cũ 1xx vs bản mới < 100) đồng bộ tất cả nơi lưu"
+                        >
+                          <Sparkles className="w-4 h-4" /> Dọn trùng
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleOpenDedupTool}
+                          className="px-4 py-2.5 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white transition-all shadow-md flex items-center gap-2 cursor-pointer active:scale-95 whitespace-nowrap"
+                        >
+                          <Database className="w-4 h-4" /> Kiểm tra & Dọn trùng lớp
+                        </button>
+                      </>
                     )}
                     <button
                       type="button"
@@ -2558,6 +2741,16 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                         <RefreshCw className={`w-3.5 h-3.5 ${isScanningMismatches ? 'animate-spin' : ''}`} />
                         <span>Đồng bộ lại dữ liệu theo mã học sinh</span>
                       </button>
+                      {isSystemAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenStudentDedupModal(selectedClass)}
+                          className="px-3.5 py-2 rounded-xl text-xs font-extrabold bg-rose-600 hover:bg-rose-700 text-white transition-all shadow-xs flex items-center gap-1.5 cursor-pointer active:scale-95"
+                          title="Kiểm tra & dọn bản ghi học sinh trùng (mã cũ 1xx vs mã mới < 100) đồng bộ tất cả nơi lưu"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" /> Dọn trùng
+                        </button>
+                      )}
                       <button
                         onClick={handleOpenAddStudentModal}
                         className="px-3.5 py-2 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white transition-all shadow-xs flex items-center gap-1.5 cursor-pointer active:scale-95"
@@ -2611,6 +2804,34 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
               {/* ROSTER SUB-TAB */}
               {classSubTab === 'roster' && (
                 <div className="space-y-4">
+                  {/* Admin warning when stored totalStudents differs from real list length or multi-key detected */}
+                  {isSystemAdmin && classDiagnostic && (classDiagnostic.hasCountMismatch || classDiagnostic.multiKeyWarning) && (
+                    <div className="bg-amber-50 border border-amber-300 text-amber-900 px-4 py-3 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+                      <div className="flex items-start gap-2.5 text-xs">
+                        <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                        <div className="space-y-0.5">
+                          {classDiagnostic.hasCountMismatch && (
+                            <p className="font-extrabold text-amber-950">
+                              ⚠️ {classDiagnostic.mismatchWarning}
+                            </p>
+                          )}
+                          {classDiagnostic.multiKeyWarning && (
+                            <p className="font-semibold text-amber-800">
+                              {classDiagnostic.multiKeyWarning}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleOpenReimportPreviewModal}
+                        className="px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold shadow-2xs cursor-pointer shrink-0 transition-all active:scale-95"
+                      >
+                        Xem đối chiếu &amp; Khôi phục
+                      </button>
+                    </div>
+                  )}
+
                   {/* Filter Bar */}
                   <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs flex flex-col sm:flex-row items-center justify-between gap-3">
                     <div className="relative w-full sm:w-80">
@@ -2720,8 +2941,54 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                           <tbody className="divide-y divide-slate-100">
                             {filteredClassStudents.length === 0 ? (
                               <tr>
-                                <td colSpan={8} className="py-8 text-center text-slate-400">
-                                  Lớp chưa có danh sách học sinh. Bấm <b>[Thêm học sinh]</b> để khởi tạo.
+                                <td colSpan={8} className="py-10 px-4 text-center text-slate-500">
+                                  {currentClassStudents.length > 0 ? (
+                                    <div className="space-y-2">
+                                      <p className="text-xs font-bold text-slate-700">
+                                        Không tìm thấy học sinh phù hợp với bộ lọc hiện tại (đang có {currentClassStudents.length} học sinh trong {selectedClass}).
+                                      </p>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setStudentSearch('');
+                                          setGenderFilter('all');
+                                        }}
+                                        className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold cursor-pointer"
+                                      >
+                                        Xóa bộ lọc tìm kiếm
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div className="space-y-3 max-w-xl mx-auto">
+                                      <p className="text-sm font-extrabold text-slate-800">
+                                        Danh sách lớp {selectedClass} đang trống hoặc chưa tải được
+                                      </p>
+                                      <p className="text-xs text-slate-500 leading-relaxed whitespace-normal">
+                                        (nguyên nhân: {classDiagnostic?.emptyReason || (isLoadingClassDiagnostic ? 'Đang tải danh sách lớp từ Cloud Firestore...' : 'Chưa tìm thấy hồ sơ học sinh nào trong class_rosters, students hoặc localStorage')})
+                                      </p>
+                                      <div className="flex items-center justify-center gap-2.5 flex-wrap pt-1">
+                                        <button
+                                          type="button"
+                                          disabled={isLoadingClassDiagnostic}
+                                          onClick={() => setClassReloadTick((t) => t + 1)}
+                                          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold cursor-pointer shadow-xs active:scale-95"
+                                        >
+                                          <RefreshCw className={`w-3.5 h-3.5 ${isLoadingClassDiagnostic ? 'animate-spin' : ''}`} />
+                                          <span>{isLoadingClassDiagnostic ? 'Đang tải lại...' : 'Thử lại'}</span>
+                                        </button>
+                                        {isSystemAdmin && (
+                                          <button
+                                            type="button"
+                                            onClick={handleOpenReimportPreviewModal}
+                                            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold cursor-pointer shadow-xs active:scale-95"
+                                          >
+                                            <Upload className="w-3.5 h-3.5" />
+                                            <span>Nhập lại danh sách</span>
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
                                 </td>
                               </tr>
                             ) : (
@@ -4504,6 +4771,159 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         </div>
       )}
 
+      {/* MODAL XEM TRƯỚC NHẬP LẠI / KHÔI PHỤC DANH SÁCH LỚP (ADMIN - KHÔNG TỰ CHẠY) */}
+      {reimportPreviewModal.isOpen && (
+        <div className="fixed inset-0 z-60 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-2xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[85vh] border border-slate-200">
+            <div className="p-5 bg-gradient-to-r from-amber-600 to-orange-600 text-white flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Database className="w-6 h-6 text-amber-100 shrink-0" />
+                <div>
+                  <h3 className="text-base font-extrabold uppercase tracking-wide">
+                    Xem Trước Đối Chiếu &amp; Nhập Lại Danh Sách ({selectedClass})
+                  </h3>
+                  <p className="text-xs text-amber-100 font-medium">
+                    Chỉ xem trước trạng thái từng kho lưu trữ — Không tự động ghi hay xóa dữ liệu gốc
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReimportPreviewModal((p) => ({ ...p, isOpen: false }))}
+                className="w-8 h-8 rounded-full bg-white/20 hover:bg-white/30 text-white flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-4 flex-1 text-xs">
+              {reimportPreviewModal.error && (
+                <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-700 font-semibold">
+                  {reimportPreviewModal.error}
+                </div>
+              )}
+
+              {reimportPreviewModal.diagnostic && (
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2.5">
+                  <div className="font-extrabold text-slate-800 uppercase text-[11px]">
+                    Hiện trạng dữ liệu tìm thấy cho {reimportPreviewModal.diagnostic.className} (Khóa chuẩn: {reimportPreviewModal.diagnostic.classKey})
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div className="bg-white p-3 rounded-xl border border-slate-200">
+                      <div className="text-[10px] font-bold text-slate-400 uppercase">class_rosters</div>
+                      <div className="text-base font-black text-indigo-700 mt-0.5">
+                        {reimportPreviewModal.diagnostic.sources.firestoreClassRosters.count} HS
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">
+                        Sĩ số ghi: {reimportPreviewModal.diagnostic.sources.firestoreClassRosters.storedTotal ?? '—'}
+                      </div>
+                    </div>
+                    <div className="bg-white p-3 rounded-xl border border-slate-200">
+                      <div className="text-[10px] font-bold text-slate-400 uppercase">Collection students</div>
+                      <div className="text-base font-black text-emerald-700 mt-0.5">
+                        {reimportPreviewModal.diagnostic.sources.firestoreStudentsCollection.count} HS
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">
+                        Khóa: {reimportPreviewModal.diagnostic.sources.firestoreStudentsCollection.keys.join(', ') || 'Không có'}
+                      </div>
+                    </div>
+                    <div className="bg-white p-3 rounded-xl border border-slate-200">
+                      <div className="text-[10px] font-bold text-slate-400 uppercase">LocalStorage</div>
+                      <div className="text-base font-black text-amber-700 mt-0.5">
+                        {reimportPreviewModal.diagnostic.sources.localStorage.count} HS
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5 truncate" title={reimportPreviewModal.diagnostic.sources.localStorage.keys.join(', ')}>
+                        Khóa: {reimportPreviewModal.diagnostic.sources.localStorage.keys.join(', ') || 'Không có'}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-600">
+                    <b>Các khóa đã tìm thấy:</b> {reimportPreviewModal.diagnostic.keysFound.join(', ') || 'Không có khóa nào'}
+                  </div>
+                </div>
+              )}
+
+              {reimportPreviewModal.isLoadingMerge ? (
+                <div className="py-6 text-center text-slate-500 flex items-center justify-center gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin text-indigo-600" />
+                  <span>Đang kiểm tra dữ liệu có thể gộp về khóa chuẩn...</span>
+                </div>
+              ) : reimportPreviewModal.mergePreview && reimportPreviewModal.mergePreview.mergedCount > 0 ? (
+                <div className="bg-indigo-50/70 border border-indigo-200 rounded-2xl p-4 space-y-2.5">
+                  <div className="font-extrabold text-indigo-950 flex items-center justify-between">
+                    <span>Đề xuất khôi phục: Gộp về khóa chuẩn ({reimportPreviewModal.mergePreview.targetDocPath})</span>
+                    <span className="px-2 py-0.5 rounded-full bg-indigo-600 text-white text-[10px]">
+                      {reimportPreviewModal.mergePreview.mergedCount} học sinh
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-indigo-900 leading-relaxed">
+                    Tìm thấy <b>{reimportPreviewModal.mergePreview.mergedCount}</b> học sinh từ các nguồn:{' '}
+                    <code className="bg-white px-1.5 py-0.5 rounded border border-indigo-200">
+                      {reimportPreviewModal.mergePreview.sourceDocIds.join(', ')}
+                    </code>
+                    . Khi xác nhận sẽ dùng <code>writeBatch</code> (tối đa {reimportPreviewModal.mergePreview.batchLimit} lệnh/lô), giữ nguyên bản gốc và giữ nguyên STT/mã HS cũ.
+                  </p>
+                  <div className="max-h-36 overflow-y-auto bg-white rounded-xl border border-indigo-100 divide-y divide-slate-100">
+                    {reimportPreviewModal.mergePreview.studentsPreview.map((sp, i) => (
+                      <div key={i} className="px-3 py-1.5 flex items-center justify-between text-[11px]">
+                        <span className="font-bold text-slate-800">{sp.stt}. {sp.name}</span>
+                        <span className="font-mono text-indigo-700">{sp.studentCode}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-600">
+                  Không tìm thấy bản ghi học sinh ở các khóa biến thể hay collection <code>students</code> trên Cloud để gộp. Thầy/Cô có thể bấm <b>Mở hộp thoại Nhập Excel</b> bên dưới để xem trước &amp; nhập lại danh sách từ tệp Excel.
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2.5 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setReimportPreviewModal((p) => ({ ...p, isOpen: false }))}
+                className="px-4 py-2 rounded-xl border border-slate-200 bg-white text-slate-700 font-bold text-xs hover:bg-slate-100 cursor-pointer"
+              >
+                Đóng
+              </button>
+              {reimportPreviewModal.mergePreview && reimportPreviewModal.mergePreview.mergedCount > 0 && (
+                <button
+                  type="button"
+                  disabled={reimportPreviewModal.isExecutingMerge}
+                  onClick={async () => {
+                    if (!reimportPreviewModal.mergePreview) return;
+                    setReimportPreviewModal((p) => ({ ...p, isExecutingMerge: true, error: null }));
+                    const res = await executeMergeClassToStandardKey(reimportPreviewModal.mergePreview);
+                    if (res.success) {
+                      setClassReloadTick((t) => t + 1);
+                      showToast(res.message, 'success');
+                      setReimportPreviewModal((p) => ({ ...p, isOpen: false, isExecutingMerge: false }));
+                    } else {
+                      setReimportPreviewModal((p) => ({ ...p, isExecutingMerge: false, error: res.message }));
+                    }
+                  }}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-extrabold text-xs cursor-pointer shadow-xs"
+                >
+                  {reimportPreviewModal.isExecutingMerge ? 'Đang gộp...' : 'Xác nhận Gộp về khóa chuẩn'}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setReimportPreviewModal((p) => ({ ...p, isOpen: false }));
+                  setIsExcelModalOpen(true);
+                }}
+                className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-extrabold text-xs cursor-pointer shadow-xs flex items-center gap-1.5"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>Mở hộp thoại Nhập Excel</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL DỌN TRÙNG BẢN GHI LỚP HỌC (ADMIN) */}
       {isDedupModalOpen && (
         <div className="fixed inset-0 z-60 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4">
@@ -4712,6 +5132,348 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
               >
                 Đóng
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL KIỂM TRA & DỌN TRÙNG HỌC SINH ĐỒNG BỘ TẤT CẢ NƠI LƯU (CHỈ ADMIN - BƯỚC 1..5) */}
+      {isStudentDedupModalOpen && isSystemAdmin && (
+        <div className="fixed inset-0 z-60 bg-slate-900/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-5xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[92vh] border border-slate-200">
+            <div className="p-5 bg-gradient-to-r from-rose-600 to-amber-600 text-white flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-2xl bg-white/15">
+                  <Sparkles className="w-5 h-5 text-amber-200" />
+                </div>
+                <div>
+                  <h3 className="text-base font-extrabold uppercase tracking-wide">
+                    Kiểm Tra &amp; Dọn Bản Ghi Học Sinh Trùng (Chỉ Admin)
+                  </h3>
+                  <p className="text-xs text-rose-100 font-medium">
+                    Kiểm tra 100% chỉ đọc trên public_rosters, students, class_rosters, localStorage, IndexedDB — Chỉ xóa khi bấm xác nhận
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <select
+                  value={studentDedupTargetClass}
+                  disabled={isInspectingStudentDedup || isExecutingStudentDedup}
+                  onChange={(e) => handleOpenStudentDedupModal(e.target.value)}
+                  className="bg-white/20 text-white text-xs font-extrabold px-3 py-1.5 rounded-xl border border-white/30 outline-none cursor-pointer"
+                >
+                  {Array.from(
+                    new Set([
+                      'Lớp 5C',
+                      'Lớp 5D',
+                      ...activeBlockClasses.map((c) => formatClassName(c.name || c.id))
+                    ])
+                  )
+                    .filter(Boolean)
+                    .map((clsOpt) => (
+                      <option key={clsOpt} value={clsOpt} className="text-slate-900">
+                        {clsOpt}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => !isExecutingStudentDedup && setIsStudentDedupModalOpen(false)}
+                  className="w-8 h-8 rounded-full bg-white/20 hover:bg-white/30 text-white flex items-center justify-center cursor-pointer transition-all"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-5 flex-1 text-xs">
+              <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-2xl text-emerald-950 flex items-start gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="font-extrabold">Cam kết bảo toàn dữ liệu bài làm &amp; bản mới:</div>
+                  <p className="text-emerald-800 leading-relaxed">
+                    Thao tác kiểm tra ban đầu hoàn toàn <b>CHỈ ĐỌC</b>. Khi Admin bấm <b>&ldquo;Xác nhận xóa bản cũ&rdquo;</b>, hệ thống chỉ xóa các bản cũ (mã <code>1xx &ge; 100</code> hoặc bản trùng tên), <b>GIỮ NGUYÊN 100%</b> bản mới mã <code>&lt; 100</code> (như <code>5D26-27-46...</code>) và <b>KHÔNG BAO GIỜ XÓA</b> bài nộp/bài làm của học sinh (<code>submissions</code>, <code>student_results</code>, <code>exam_drafts</code>, <code>score_records</code>).
+                  </p>
+                </div>
+              </div>
+
+              {isInspectingStudentDedup && (
+                <div className="py-12 text-center space-y-3">
+                  <RefreshCw className="w-8 h-8 text-rose-600 animate-spin mx-auto" />
+                  <p className="text-sm font-bold text-slate-700">
+                    Đang kiểm tra đồng bộ {studentDedupTargetClass} trên public_rosters, students, class_rosters, localStorage &amp; IndexedDB...
+                  </p>
+                </div>
+              )}
+
+              {studentDedupError && (
+                <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl text-rose-800 font-bold flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{studentDedupError}</span>
+                </div>
+              )}
+
+              {/* BƯỚC 5: BÁO CÁO SỐ LƯỢNG TRƯỚC & SAU DỌN TRÙNG */}
+              {!isInspectingStudentDedup && studentDedupResult && (
+                <div className="bg-emerald-50/80 border-2 border-emerald-300 rounded-2xl p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-extrabold text-emerald-950 text-sm flex items-center gap-2">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                      <span>BƯỚC 5 — BÁO CÁO SAU KHI DỌN TRÙNG ({studentDedupResult.afterReport.className})</span>
+                    </div>
+                    {studentDedupResult.backupStorageKey && (
+                      <span className="px-2.5 py-1 rounded-lg bg-white border border-emerald-200 text-[11px] font-mono text-emerald-800">
+                        Sao lưu: {studentDedupResult.backupStorageKey}
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                    <div className="bg-white p-3 rounded-xl border border-emerald-200">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Đã xóa bản cũ</div>
+                      <div className="text-lg font-black text-rose-600">{studentDedupResult.deletedOldCount}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded-xl border border-emerald-200">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Giữ lại bản mới (&lt; 100)</div>
+                      <div className="text-lg font-black text-emerald-700">{studentDedupResult.keptCount}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded-xl border border-emerald-200">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Doc collection students đã xóa</div>
+                      <div className="text-lg font-black text-indigo-700">{studentDedupResult.deletedStudentDocsCount}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded-xl border border-emerald-200">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase">Doc khóa biến thể đã dọn</div>
+                      <div className="text-lg font-black text-amber-700">{studentDedupResult.cleanedVariantDocsCount}</div>
+                    </div>
+                  </div>
+
+                  <div className="border border-emerald-200 rounded-xl overflow-hidden bg-white">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead className="bg-emerald-100/70 text-emerald-950 font-extrabold text-[10px] uppercase">
+                        <tr>
+                          <th className="p-2.5">Nơi lưu</th>
+                          <th className="p-2.5 text-center">Trước dọn (Tổng / 1xx / &lt;100)</th>
+                          <th className="p-2.5 text-center">Sau dọn (Tổng / 1xx / &lt;100)</th>
+                          <th className="p-2.5">Ghi chú sau dọn</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-emerald-100">
+                        {studentDedupResult.afterReport.stores.map((afterStore) => {
+                          const beforeStore = studentDedupResult.beforeReport.stores.find(
+                            (s) => s.storeId === afterStore.storeId
+                          );
+                          return (
+                            <tr key={afterStore.storeId}>
+                              <td className="p-2.5 font-mono font-bold text-slate-900">{afterStore.label}</td>
+                              <td className="p-2.5 text-center text-slate-600">
+                                {beforeStore
+                                  ? `${beforeStore.totalCount} (${beforeStore.old1xxCount} cũ / ${beforeStore.newUnder100Count} mới)`
+                                  : '—'}
+                              </td>
+                              <td className="p-2.5 text-center font-extrabold text-emerald-800">
+                                {afterStore.totalCount} ({afterStore.old1xxCount} cũ / {afterStore.newUnder100Count} mới)
+                              </td>
+                              <td className="p-2.5 text-slate-600">{afterStore.note}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {!isInspectingStudentDedup && studentDedupReport && (
+                <>
+                  {/* BƯỚC 1: KIỂM TRA SỐ LƯỢNG TỪNG NƠI LƯU */}
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <h4 className="font-extrabold text-slate-900 uppercase text-[11px] flex items-center gap-1.5">
+                        <Database className="w-4 h-4 text-indigo-600" />
+                        <span>BƯỚC 1 — KIỂM TRA HIỆN TRẠNG TẤT CẢ NƠI LƯU ({studentDedupReport.className})</span>
+                      </h4>
+                      <span className="text-[11px] text-slate-500 font-medium">
+                        Khóa chuẩn: <code className="font-bold text-indigo-700">{studentDedupReport.classKey}</code>
+                      </span>
+                    </div>
+
+                    <div className="border border-slate-200 rounded-2xl overflow-hidden">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead className="bg-slate-100 text-slate-700 font-extrabold uppercase text-[10px] border-b border-slate-200">
+                          <tr>
+                            <th className="p-3">Nơi lưu</th>
+                            <th className="p-3 text-center">Tổng số HS</th>
+                            <th className="p-3 text-center">Bản cũ 1xx (&ge; 100)</th>
+                            <th className="p-3 text-center">Bản mới (&lt; 100)</th>
+                            <th className="p-3">Chi tiết / Khóa tìm thấy</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 text-slate-700">
+                          {studentDedupReport.stores.map((st) => (
+                            <tr key={st.storeId} className="hover:bg-slate-50">
+                              <td className="p-3 font-mono font-bold text-slate-900 whitespace-nowrap">{st.label}</td>
+                              <td className="p-3 text-center font-black text-slate-900">{st.totalCount}</td>
+                              <td className="p-3 text-center">
+                                <span
+                                  className={`px-2 py-0.5 rounded-md font-extrabold ${
+                                    st.old1xxCount > 0 ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-500'
+                                  }`}
+                                >
+                                  {st.old1xxCount}
+                                </span>
+                              </td>
+                              <td className="p-3 text-center">
+                                <span
+                                  className={`px-2 py-0.5 rounded-md font-extrabold ${
+                                    st.newUnder100Count > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'
+                                  }`}
+                                >
+                                  {st.newUnder100Count}
+                                </span>
+                              </td>
+                              <td className="p-3 text-slate-600">{st.note}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Giải thích vì sao xóa trên giao diện không xóa được các nơi còn lại */}
+                    <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-amber-950 space-y-1.5">
+                      <div className="font-extrabold flex items-center gap-1.5 text-amber-900">
+                        <Info className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Nguyên nhân xóa trong giao diện trước đây vẫn còn bản cũ ở các nơi khác:</span>
+                      </div>
+                      <ul className="list-disc pl-5 space-y-1 text-[11px] text-amber-900 leading-relaxed">
+                        {studentDedupReport.whyUiDeleteFailedReasons.map((reason, idx) => (
+                          <li key={idx}>{reason}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+
+                  {/* BƯỚC 2: BẢNG XEM TRƯỚC CÁC BẢN CŨ SẼ XÓA */}
+                  <div className="space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h4 className="font-extrabold text-slate-900 uppercase text-[11px] flex items-center gap-1.5">
+                        <Eye className="w-4 h-4 text-rose-600" />
+                        <span>BƯỚC 2 — XEM TRƯỚC CÁC BẢN CŨ SẼ XÓA ({studentDedupReport.recordsToDelete.length} bản ghi)</span>
+                      </h4>
+                      <div className="flex items-center gap-2 text-[11px] font-bold">
+                        <span className="px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-800">
+                          Sẽ giữ nguyên: {studentDedupReport.recordsToKeep.length} HS bản mới (&lt; 100)
+                        </span>
+                        <span className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-800">
+                          Sẽ xóa: {studentDedupReport.recordsToDelete.length} bản cũ / trùng
+                        </span>
+                        {studentDedupReport.variantRosterDocsToClean.length > 0 && (
+                          <span className="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-800">
+                            Dọn {studentDedupReport.variantRosterDocsToClean.length} doc khóa biến thể
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {studentDedupReport.recordsToDelete.length === 0 &&
+                    studentDedupReport.variantRosterDocsToClean.length === 0 ? (
+                      <div className="text-center py-8 bg-emerald-50/50 border border-emerald-200 rounded-2xl space-y-1.5">
+                        <CheckCircle2 className="w-8 h-8 text-emerald-600 mx-auto" />
+                        <div className="font-extrabold text-emerald-950">
+                          Không phát hiện bản cũ 1xx hay bản ghi trùng nào cần xóa trong {studentDedupReport.className}!
+                        </div>
+                        <p className="text-emerald-700">
+                          Hiện giữ {studentDedupReport.recordsToKeep.length} học sinh sạch trên hệ thống.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="border border-rose-200 rounded-2xl overflow-hidden max-h-72 overflow-y-auto">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead className="bg-rose-50 text-rose-950 font-extrabold uppercase text-[10px] sticky top-0 border-b border-rose-200">
+                            <tr>
+                              <th className="p-2.5 text-center">STT</th>
+                              <th className="p-2.5">Mã cũ sẽ xóa</th>
+                              <th className="p-2.5">Họ tên bản cũ</th>
+                              <th className="p-2.5">Bản mới giữ lại (&lt; 100)</th>
+                              <th className="p-2.5">Nơi lưu tìm thấy</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-rose-100 text-slate-700">
+                            {studentDedupReport.recordsToDelete.map((item, idx) => (
+                              <tr key={item.previewId} className="hover:bg-rose-50/40 align-top">
+                                <td className="p-2.5 text-center font-bold text-slate-500">{idx + 1}</td>
+                                <td className="p-2.5 font-mono font-bold text-rose-700 whitespace-nowrap">
+                                  {item.code || '—'}
+                                </td>
+                                <td className="p-2.5 font-semibold text-slate-900">{item.name}</td>
+                                <td className="p-2.5">
+                                  {item.matchedKeepCode ? (
+                                    <div className="space-y-0.5">
+                                      <span className="px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 font-mono font-bold text-emerald-800">
+                                        {item.matchedKeepCode}
+                                      </span>
+                                      <div className="text-[11px] font-bold text-emerald-900">{item.matchedKeepName}</div>
+                                    </div>
+                                  ) : (
+                                    <span className="text-[11px] text-amber-700 font-semibold">{item.reason}</span>
+                                  )}
+                                </td>
+                                <td className="p-2.5">
+                                  <div className="flex flex-wrap gap-1">
+                                    {item.locations.map((loc, lIdx) => (
+                                      <span
+                                        key={lIdx}
+                                        className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700"
+                                      >
+                                        {loc}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0">
+              <button
+                type="button"
+                disabled={isInspectingStudentDedup || isExecutingStudentDedup}
+                onClick={() => handleOpenStudentDedupModal(studentDedupTargetClass)}
+                className="px-4 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-50 text-slate-700 font-bold text-xs flex items-center gap-2 cursor-pointer transition-all"
+              >
+                <RefreshCw className={`w-4 h-4 ${isInspectingStudentDedup ? 'animate-spin' : ''}`} /> Kiểm tra lại
+              </button>
+
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={isExecutingStudentDedup}
+                  onClick={() => setIsStudentDedupModalOpen(false)}
+                  className="px-5 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-50 text-slate-700 font-bold text-xs transition-all cursor-pointer"
+                >
+                  Đóng
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    isInspectingStudentDedup ||
+                    isExecutingStudentDedup ||
+                    !studentDedupReport ||
+                    (studentDedupReport.recordsToDelete.length === 0 &&
+                      studentDedupReport.variantRosterDocsToClean.length === 0)
+                  }
+                  onClick={handleConfirmExecuteOldStudentCleanup}
+                  className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-extrabold text-xs shadow-md flex items-center gap-2 cursor-pointer transition-all active:scale-95"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>{isExecutingStudentDedup ? 'Đang xóa đồng bộ...' : 'Xác nhận xóa bản cũ'}</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

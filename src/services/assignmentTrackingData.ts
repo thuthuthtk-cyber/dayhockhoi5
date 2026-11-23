@@ -3,8 +3,9 @@ import { db } from '../firebase';
 import { HomeworkAssignment, StudentRecord } from '../types';
 import { getStudentsFromLocalStorage, generateDefaultClassRoster } from './studentStorageService';
 import { formatSubmissionDateTime, getCurrentSubmissionTimestamp } from '../utils/scoreUtils';
+import { normalizeStudentCode } from './studentCode';
 
-export const STANDARD_STUDENT_CODE_REGEX = /^[1-5][A-Z]\d{2}-\d{2}-[1-9]\d{0,2}$/;
+export const STANDARD_STUDENT_CODE_REGEX = /^[1-5][A-Z]\d{2}-\d{2}-0*[1-9]\d{0,2}$/;
 
 export interface TrackingStudentRow {
   code: string;
@@ -219,8 +220,7 @@ export function formatDurationDisplay(seconds: number, fallbackTimeStr = ''): st
  * Standardize student code for matching (strictly uppercase, no spaces)
  */
 export function normalizeStudentCodeStrict(raw?: string): string {
-  if (!raw || typeof raw !== 'string') return '';
-  return raw.replace(/\s+/g, '').toUpperCase();
+  return normalizeStudentCode(raw);
 }
 
 /**

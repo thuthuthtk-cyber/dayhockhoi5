@@ -87,6 +87,20 @@
         "updatedAt": { "type": "string", "maxLength": 64 }
       }
     },
+    "PublicRoster": {
+      "title": "PublicRoster",
+      "description": "Publicly readable login-portal class student roster",
+      "type": "object",
+      "properties": {
+        "className": { "type": "string", "maxLength": 100 },
+        "classKey": { "type": "string", "maxLength": 50 },
+        "totalStudents": { "type": "integer" },
+        "male": { "type": "integer" },
+        "female": { "type": "integer" },
+        "students": { "type": "array" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
+    },
     "Student": {
       "title": "Student",
       "description": "Individual student record",
@@ -384,6 +398,10 @@
     "/notifications/{notificationId}": {
       "schema": { "$ref": "#/entities/Notification" },
       "description": "User notifications"
+    },
+    "/public_rosters/{rosterId}": {
+      "schema": { "$ref": "#/entities/PublicRoster" },
+      "description": "Sanitized class rosters used for student portal lookup"
     },
     "/questions/{questionId}": {
       "schema": { "$ref": "#/entities/Question" },

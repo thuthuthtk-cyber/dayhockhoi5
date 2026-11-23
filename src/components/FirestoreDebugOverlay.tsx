@@ -18,6 +18,13 @@ import {
   BlockedMetricItem
 } from '../services/firestoreWriteTracker';
 import { firebaseConfig, resetFirestoreQuotaAndEnableNetwork } from '../firebaseConfig';
+import {
+  scanAllClassesComparisonForDebug,
+  previewMergeClassToStandardKey,
+  executeMergeClassToStandardKey,
+  ClassDebugComparisonRow,
+  MergeToStandardKeyPreview
+} from '../services/studentStorageService';
 
 export const FirestoreDebugOverlay: React.FC = () => {
   const [isDebugMode, setIsDebugMode] = useState<boolean>(false);
@@ -31,6 +38,33 @@ export const FirestoreDebugOverlay: React.FC = () => {
   }>({ isOpen: false, results: [], studentCode: '' });
   const [confirmMigrationIdx, setConfirmMigrationIdx] = useState<number | null>(null);
   const [debugNotice, setDebugNotice] = useState<string | null>(null);
+  const [classComparisonRows, setClassComparisonRows] = useState<ClassDebugComparisonRow[]>([]);
+  const [isScanningClasses, setIsScanningClasses] = useState<boolean>(false);
+  const [mergePreviewModal, setMergePreviewModal] = useState<{
+    isOpen: boolean;
+    preview: MergeToStandardKeyPreview | null;
+    isLoading: boolean;
+    isExecuting: boolean;
+    error: string | null;
+  }>({
+    isOpen: false,
+    preview: null,
+    isLoading: false,
+    isExecuting: false,
+    error: null
+  });
+
+  const runReadOnlyClassComparison = async () => {
+    setIsScanningClasses(true);
+    try {
+      const rows = await scanAllClassesComparisonForDebug();
+      setClassComparisonRows(rows);
+    } catch (err: any) {
+      setDebugNotice('Lỗi quét so sánh lớp: ' + (err?.message || String(err)));
+    } finally {
+      setIsScanningClasses(false);
+    }
+  };
 
   useEffect(() => {
     // Check if ?debug=1 or debug=true in location search/hash
@@ -39,6 +73,7 @@ export const FirestoreDebugOverlay: React.FC = () => {
       const hash = window.location.hash || '';
       if (search.includes('debug=1') || search.includes('debug=true') || hash.includes('debug=1')) {
         setIsDebugMode(true);
+        runReadOnlyClassComparison();
       }
     };
 
@@ -112,8 +147,8 @@ export const FirestoreDebugOverlay: React.FC = () => {
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-emerald-400" />
               <span className="font-bold text-sm text-white">Firestore Write Tracker (?debug=1)</span>
-              <span className="bg-indigo-500/20 text-indigo-300 font-mono text-[11px] px-2 py-0.5 rounded-full border border-indigo-500/30 font-semibold" title="Active Firebase Project">
-                {firebaseConfig.projectId}
+              <span className="bg-indigo-500/20 text-indigo-300 font-mono text-[11px] px-2 py-0.5 rounded-full border border-indigo-500/30 font-semibold" title="Active Firebase Project & Database">
+                {firebaseConfig.projectId} / (default)
               </span>
               <span className="bg-emerald-500/20 text-emerald-300 font-mono text-[11px] px-2 py-0.5 rounded-full border border-emerald-500/30 font-semibold">
                 Tổng: {stats.totalWrites} lượt ghi
@@ -292,8 +327,200 @@ export const FirestoreDebugOverlay: React.FC = () => {
                   </div>
                 </div>
               )}
+
+              {/* 4. Class Roster Comparison Table (?debug=1, STRICTLY READ-ONLY) */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <h5 className="font-semibold text-slate-300 flex items-center gap-1.5 text-[11px] uppercase tracking-wider">
+                    <Database className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>4. Bảng so sánh sĩ số &amp; khóa từng lớp (Chỉ đọc)</span>
+                  </h5>
+                  <button
+                    type="button"
+                    disabled={isScanningClasses}
+                    onClick={runReadOnlyClassComparison}
+                    className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 text-[10px] font-bold cursor-pointer disabled:opacity-50"
+                  >
+                    {isScanningClasses ? 'Đang quét...' : 'Quét lại'}
+                  </button>
+                </div>
+                {classComparisonRows.length === 0 ? (
+                  <div className="text-slate-500 italic text-[11px] py-2 bg-slate-800/30 rounded-lg text-center">
+                    {isScanningClasses ? 'Đang đối chiếu dữ liệu lớp từ Firestore & LocalStorage...' : 'Chưa có dữ liệu đối chiếu.'}
+                  </div>
+                ) : (
+                  <div className="bg-slate-800/40 rounded-xl overflow-x-auto border border-slate-700/50">
+                    <table className="w-full text-left border-collapse text-[10px]">
+                      <thead>
+                        <tr className="bg-slate-800/80 text-slate-400 uppercase border-b border-slate-700/60">
+                          <th className="py-1.5 px-2">Lớp</th>
+                          <th className="py-1.5 px-2">Khóa tìm thấy</th>
+                          <th className="py-1.5 px-2 text-right">class_rosters</th>
+                          <th className="py-1.5 px-2 text-right">students</th>
+                          <th className="py-1.5 px-2 text-right">localStorage</th>
+                          <th className="py-1.5 px-2 text-right">Hiển thị</th>
+                          <th className="py-1.5 px-2">Cảnh báo / Thao tác</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-700/40 font-mono">
+                        {classComparisonRows.map((row) => (
+                          <tr key={row.classKey} className="hover:bg-slate-700/30 align-top">
+                            <td className="py-1.5 px-2 font-bold text-cyan-300 whitespace-nowrap">
+                              {row.className}
+                            </td>
+                            <td className="py-1.5 px-2 text-slate-300 max-w-[160px] break-all">
+                              {row.keysFound.length > 0 ? row.keysFound.join(', ') : '—'}
+                            </td>
+                            <td className="py-1.5 px-2 text-right text-indigo-300 whitespace-nowrap">
+                              {row.classRostersCount}
+                              {row.storedTotalStudents !== null ? ` (ghi:${row.storedTotalStudents})` : ''}
+                            </td>
+                            <td className="py-1.5 px-2 text-right text-emerald-300">
+                              {row.studentsCollectionCount}
+                            </td>
+                            <td className="py-1.5 px-2 text-right text-amber-300">
+                              {row.localStorageCount}
+                            </td>
+                            <td className="py-1.5 px-2 text-right font-bold text-white">
+                              {row.displayedCount}
+                            </td>
+                            <td className="py-1.5 px-2 space-y-1">
+                              {row.multiKeyWarning && (
+                                <div className="text-amber-300 font-sans leading-snug">⚠️ {row.multiKeyWarning}</div>
+                              )}
+                              {row.mismatchWarning && (
+                                <div className="text-rose-300 font-sans leading-snug">⚠️ {row.mismatchWarning}</div>
+                              )}
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  setMergePreviewModal({
+                                    isOpen: true,
+                                    preview: null,
+                                    isLoading: true,
+                                    isExecuting: false,
+                                    error: null
+                                  });
+                                  try {
+                                    const preview = await previewMergeClassToStandardKey(row.classKey);
+                                    setMergePreviewModal({
+                                      isOpen: true,
+                                      preview,
+                                      isLoading: false,
+                                      isExecuting: false,
+                                      error: null
+                                    });
+                                  } catch (err: any) {
+                                    setMergePreviewModal({
+                                      isOpen: true,
+                                      preview: null,
+                                      isLoading: false,
+                                      isExecuting: false,
+                                      error: err?.message || String(err)
+                                    });
+                                  }
+                                }}
+                                className="px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-sans font-bold text-[10px] cursor-pointer"
+                              >
+                                Xem trước Gộp về khóa chuẩn
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {classComparisonRows[0]?.indexedDbDatabases?.length > 0 && (
+                      <div className="px-2.5 py-1.5 bg-slate-800/60 border-t border-slate-700/50 text-[10px] text-slate-400 font-mono">
+                        IndexedDB: {classComparisonRows[0].indexedDbDatabases.join(', ')}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* MODAL XEM TRƯỚC GỘP VỀ KHÓA CHUẨN (?debug=1 - CHỈ XEM TRƯỚC, KHÔNG TỰ CHẠY) */}
+      {mergePreviewModal.isOpen && (
+        <div className="fixed inset-0 z-[9999999] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 text-slate-100 rounded-2xl max-w-xl w-full max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+            <div className="bg-slate-800 px-5 py-3.5 border-b border-slate-700 flex items-center justify-between">
+              <div className="font-bold text-sm text-white">
+                Đề xuất khôi phục: Gộp về khóa chuẩn {mergePreviewModal.preview?.targetDocPath || ''}
+              </div>
+              <button
+                type="button"
+                onClick={() => setMergePreviewModal((p) => ({ ...p, isOpen: false }))}
+                className="p-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 overflow-y-auto space-y-3 text-xs flex-1">
+              {mergePreviewModal.isLoading && (
+                <div className="py-6 text-center text-slate-400">Đang tạo bản xem trước (chỉ đọc)...</div>
+              )}
+              {mergePreviewModal.error && (
+                <div className="p-3 bg-rose-950/50 border border-rose-500/40 rounded-xl text-rose-300">
+                  {mergePreviewModal.error}
+                </div>
+              )}
+              {mergePreviewModal.preview && (
+                <div className="space-y-3">
+                  <div className="p-3 bg-indigo-950/40 border border-indigo-500/40 rounded-xl space-y-1 text-slate-200">
+                    <div><b>Đích:</b> <code className="text-cyan-300">{mergePreviewModal.preview.targetDocPath}</code></div>
+                    <div><b>Nguồn tìm thấy:</b> <code className="text-amber-300">{mergePreviewModal.preview.sourceDocIds.join(', ') || 'Không có'}</code></div>
+                    <div><b>Tổng số HS sau gộp:</b> <span className="text-emerald-300 font-bold">{mergePreviewModal.preview.mergedCount} HS</span> (hiện tại ở khóa chuẩn: {mergePreviewModal.preview.existingStandardCount} HS)</div>
+                    <div className="text-[11px] text-slate-400 pt-1">
+                      Nguyên tắc: dùng <code>writeBatch</code> tối đa {mergePreviewModal.preview.batchLimit} lệnh/lô, KHÔNG xóa bản gốc, giữ nguyên STT &amp; mã HS cũ. Công cụ này không tự chạy.
+                    </div>
+                  </div>
+                  {mergePreviewModal.preview.studentsPreview.length > 0 && (
+                    <div className="bg-slate-800/60 border border-slate-700 rounded-xl divide-y divide-slate-700/60 max-h-48 overflow-y-auto">
+                      {mergePreviewModal.preview.studentsPreview.map((s, i) => (
+                        <div key={i} className="px-3 py-1.5 flex justify-between font-mono text-[11px]">
+                          <span className="text-slate-200">{s.stt}. {s.name}</span>
+                          <span className="text-cyan-300">{s.studentCode}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="p-4 bg-slate-800 border-t border-slate-700 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setMergePreviewModal((p) => ({ ...p, isOpen: false }))}
+                className="px-4 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold text-xs cursor-pointer"
+              >
+                Đóng
+              </button>
+              {mergePreviewModal.preview && mergePreviewModal.preview.mergedCount > 0 && (
+                <button
+                  type="button"
+                  disabled={mergePreviewModal.isExecuting}
+                  onClick={async () => {
+                    if (!mergePreviewModal.preview) return;
+                    setMergePreviewModal((p) => ({ ...p, isExecuting: true, error: null }));
+                    const res = await executeMergeClassToStandardKey(mergePreviewModal.preview);
+                    if (res.success) {
+                      setDebugNotice(res.message);
+                      setMergePreviewModal((p) => ({ ...p, isOpen: false, isExecuting: false }));
+                      runReadOnlyClassComparison();
+                    } else {
+                      setMergePreviewModal((p) => ({ ...p, isExecuting: false, error: res.message }));
+                    }
+                  }}
+                  className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs cursor-pointer"
+                >
+                  {mergePreviewModal.isExecuting ? 'Đang thực thi...' : 'Xác nhận Gộp (Admin)'}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
