@@ -87,6 +87,7 @@ import {
 
 import { StudentSubmissionDetailModal } from './StudentSubmissionDetailModal';
 import { createNotificationIfNotExists, LOW_SCORE_THRESHOLD } from '../../services/notificationService';
+import { canManageClass } from '../../utils/permissions';
 import {
   AssignmentTrackingResult,
   TrackingStudentRow,
@@ -380,16 +381,11 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     const unsubSubs = onSnapshot(
       subsCollRef,
       (snap) => {
-        const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        if (docs.length > 0) {
-          setLiveSubmissions(prev => {
-            const map = new Map<string, any>();
-            prev.forEach((s: any) => map.set(s.id || s.studentId || s.studentCode || s.maHs, s));
-            docs.forEach((s: any) => map.set(s.id || s.studentId || s.studentCode || s.maHs, s));
-            return Array.from(map.values());
-          });
-          setSubmissionSyncTick(t => t + 1);
-        }
+        const docs = snap.docs
+          .map(d => ({ id: d.id, ...d.data() }))
+          .filter((d: any) => d.status !== 'waiting');
+        setLiveSubmissions(docs);
+        setSubmissionSyncTick(t => t + 1);
       },
       (err) => {
         console.warn('Real-time subcollection submissions listener error:', err);
@@ -408,12 +404,18 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     setIsSyncingSubmissions(true);
     try {
       const mergedSubsMap = new Map<string, any>();
+      const getSubKey = (s: any, fallbackId?: string): string => {
+        const raw = s?.studentCode || s?.maHs || s?.studentId || s?.code || fallbackId || '';
+        const norm = normalizeStudentCode(String(raw));
+        return norm || String(raw).trim().toUpperCase();
+      };
 
       // 1. Existing submissions on detailAssignment
       if (Array.isArray(detailAssignment.submissions)) {
         detailAssignment.submissions.forEach((s: any) => {
-          const key = s.studentId || s.studentCode || s.maHs || s.id;
-          if (key) mergedSubsMap.set(String(key).toLowerCase(), s);
+          if (!s || s.status === 'waiting') return;
+          const key = getSubKey(s, s.id);
+          if (key) mergedSubsMap.set(key, s);
         });
       }
 
@@ -423,9 +425,10 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
           const subsCollRef = collection(db, 'assignments', detailAssignment.id, 'submissions');
           const subsSnap = await getDocs(subsCollRef);
           subsSnap.docs.forEach(docSnap => {
-            const data = { id: docSnap.id, ...docSnap.data() };
-            const key = (data as any).studentId || (data as any).studentCode || (data as any).maHs || docSnap.id;
-            if (key) mergedSubsMap.set(String(key).toLowerCase(), data);
+            const data = { id: docSnap.id, ...docSnap.data() } as any;
+            if (data.status === 'waiting') return;
+            const key = getSubKey(data, docSnap.id);
+            if (key) mergedSubsMap.set(key, data);
           });
         } catch (err) {
           console.warn('Không thể đọc subcollection submissions:', err);
@@ -439,8 +442,9 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
             const assignData = assignSnap.data() as HomeworkAssignment;
             if (Array.isArray(assignData.submissions)) {
               assignData.submissions.forEach((s: any) => {
-                const key = s.studentId || s.studentCode || s.maHs || s.id;
-                if (key) mergedSubsMap.set(String(key).toLowerCase(), s);
+                if (!s || s.status === 'waiting') return;
+                const key = getSubKey(s, s.id);
+                if (key) mergedSubsMap.set(key, s);
               });
             }
           }
@@ -449,38 +453,42 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
         }
       }
 
-      // 3. Scan localStorage for student submissions
+      // 3. Scan localStorage for student submissions (strictly matching assignmentId, NEVER title)
       if (typeof window !== 'undefined') {
         const targetClass = detailAssignment.targetClass || 'Lớp 5C';
         const classStudents = getStudentsFromLocalStorage(targetClass) || [];
         classStudents.forEach(st => {
-          const keys = [st.code, st.id, st.username].filter(Boolean) as string[];
+          const keys = Array.from(new Set([st.code, normalizeStudentCode(st.code), st.id, st.username].filter(Boolean) as string[]));
           keys.forEach(k => {
             try {
               const raw = localStorage.getItem(`eduplay_k5_student_submissions_${k}`);
               if (raw) {
                 const parsed = JSON.parse(raw);
                 if (Array.isArray(parsed)) {
-                  const m = parsed.find((item: any) =>
-                    item.assignment?.id === detailAssignment.id ||
-                    item.id === detailAssignment.id ||
-                    item.assignmentId === detailAssignment.id ||
-                    (item.title && item.title === detailAssignment.title)
-                  );
+                  const m = parsed.find((item: any) => {
+                    if (!item || item.status === 'waiting') return false;
+                    const aid = item.assignment?.id || item.assignmentId || item.id;
+                    if (!aid) return false;
+                    return aid === detailAssignment.id || (detailAssignment.originalAssignmentId && aid === detailAssignment.originalAssignmentId);
+                  });
                   if (m) {
-                    mergedSubsMap.set(String(st.code).toLowerCase(), {
-                      id: m.id || `sub-${st.code}`,
-                      studentId: st.code,
-                      studentCode: st.code,
-                      maHs: st.code,
-                      studentName: st.fullName || st.name,
-                      score: m.score !== undefined ? m.score : (m.totalScore !== undefined ? m.totalScore : '-'),
-                      totalScore: m.totalScore !== undefined ? m.totalScore : (m.score !== undefined ? m.score : '-'),
-                      submittedAt: m.submittedTime || m.submittedAt || new Date().toLocaleString('vi-VN'),
-                      submittedTime: m.submittedTime || m.submittedAt || new Date().toLocaleString('vi-VN'),
-                      answers: m.answers || [],
-                      status: 'submitted'
-                    });
+                    const normStCode = normalizeStudentCode(st.code || k);
+                    if (normStCode) {
+                      mergedSubsMap.set(normStCode, {
+                        id: m.id || `sub-${normStCode}`,
+                        assignmentId: detailAssignment.id,
+                        studentId: normStCode,
+                        studentCode: normStCode,
+                        maHs: normStCode,
+                        studentName: st.fullName || st.name,
+                        score: m.score !== undefined ? m.score : (m.totalScore !== undefined ? m.totalScore : '-'),
+                        totalScore: m.totalScore !== undefined ? m.totalScore : (m.score !== undefined ? m.score : '-'),
+                        submittedAt: m.submittedTime || m.submittedAt || new Date().toLocaleString('vi-VN'),
+                        submittedTime: m.submittedTime || m.submittedAt || new Date().toLocaleString('vi-VN'),
+                        answers: m.answers || [],
+                        status: 'submitted'
+                      });
+                    }
                   }
                 }
               }
@@ -488,16 +496,17 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
           });
         });
 
-        // Also check eduplay_k5_all_exam_submissions & eduplay_k5_exam_subs_{id}
+        // Also check eduplay_k5_exam_subs_{id}
         try {
           const rawExamSubs = localStorage.getItem(`eduplay_k5_exam_subs_${detailAssignment.id}`);
           if (rawExamSubs) {
             const parsed = JSON.parse(rawExamSubs);
             if (Array.isArray(parsed)) {
               parsed.forEach((s: any) => {
-                const sCode = s.studentId || s.studentCode || s.maHs;
-                if (sCode) {
-                  mergedSubsMap.set(String(sCode).toLowerCase(), {
+                if (!s || s.status === 'waiting') return;
+                const key = getSubKey(s);
+                if (key) {
+                  mergedSubsMap.set(key, {
                     ...s,
                     status: 'submitted'
                   });
@@ -548,69 +557,89 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   // Async handler for confirming delete submission via React State Modal
   const handleConfirmDeleteSubmission = async () => {
     if (!deleteTarget || !detailAssignment?.id) {
-      console.warn('[Delete Submission] deleteTarget hoặc detailAssignment không có dữ liệu.', {
-        deleteTarget,
-        detailAssignmentId: detailAssignment?.id
-      });
       return;
     }
 
-    const targetCode = deleteTarget.code;
+    const canDelete = isAdmin || canManageClass(activeTeacherProfile, detailAssignment.targetClass) || isAssignmentOwner(detailAssignment);
+    if (!canDelete) {
+      setDeleteError('Bạn không có quyền xóa kết quả bài làm của lớp này.');
+      return;
+    }
+
+    const targetNormCode = normalizeStudentCode(deleteTarget.code);
     const targetName = deleteTarget.name;
     const assignmentId = detailAssignment.id;
-
-    console.log(`[Delete Submission Start] Deleting assignment submission: StudentName="${targetName}", StudentCode="${targetCode}", AssignmentId="${assignmentId}"`);
 
     setIsDeletingSubmission(true);
     setDeleteError(null);
 
     try {
-      const result = await resetOrDeleteStudentAssignmentSubmission({
-        studentCode: targetCode,
-        studentName: targetName,
-        studentId: targetCode,
+      await resetOrDeleteStudentAssignmentSubmission({
+        studentCode: targetNormCode,
+        studentId: targetNormCode,
         assignmentId: assignmentId,
         originalAssignmentId: detailAssignment.originalAssignmentId,
         targetClass: detailAssignment.targetClass
       });
 
-      console.log(`[Delete Submission Success] Resetted/deleted submission for ${targetName} (${targetCode}):`, result);
+      const isNotDeletedStudent = (s: any): boolean => {
+        if (!s || s.status === 'waiting') return false;
+        const candidates = [s.studentCode, s.code, s.maHs, s.studentId, s.id]
+          .filter(Boolean)
+          .map((c: any) => normalizeStudentCode(String(c)));
+        return !candidates.includes(targetNormCode);
+      };
 
-      // 1. Immediately remove student's submission from liveSubmissions state
-      setLiveSubmissions(prev => prev.filter((s: any) => {
-        const code = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || s.id || '');
-        return code !== normalizeStudentCode(targetCode);
-      }));
+      const nextLiveSubmissions = liveSubmissions.filter(isNotDeletedStudent);
+      const existingAssignSubs = Array.isArray(detailAssignment.submissions) ? detailAssignment.submissions : [];
+      const nextAssignSubmissions = existingAssignSubs.filter(isNotDeletedStudent);
+      const nextSubmittedIds = Array.isArray(detailAssignment.submittedIds)
+        ? detailAssignment.submittedIds.filter((id: string) => normalizeStudentCode(String(id || '')) !== targetNormCode)
+        : [];
 
-      // 2. Update detailAssignment.submissions locally so tracking list re-evaluates
-      setDetailAssignment(prev => {
-        if (!prev) return null;
-        const subs = Array.isArray(prev.submissions) ? prev.submissions : [];
-        const updatedSubs = subs.filter((s: any) => {
-          const code = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || s.id || '');
-          return code !== normalizeStudentCode(targetCode);
-        });
-        return {
-          ...prev,
-          submissions: updatedSubs,
-          submittedCount: Math.max(0, updatedSubs.length),
-          completedCount: Math.max(0, updatedSubs.length)
-        };
+      const remainingCodes = new Set<string>();
+      [...nextAssignSubmissions, ...nextLiveSubmissions].forEach((s: any) => {
+        const sc = normalizeStudentCode(String(s?.studentCode || s?.maHs || s?.studentId || s?.code || ''));
+        if (sc) remainingCodes.add(sc);
       });
+      nextSubmittedIds.forEach((id: string) => {
+        const sc = normalizeStudentCode(String(id || ''));
+        if (sc) remainingCodes.add(sc);
+      });
+      const nextCompletedCount = remainingCodes.size;
 
-      // 3. Force submissionSyncTick increment to trigger recalculation of trackingStudentsList
+      const cleanedDetailAssignment: HomeworkAssignment = {
+        ...detailAssignment,
+        submissions: nextAssignSubmissions,
+        submittedIds: nextSubmittedIds,
+        submittedCount: nextCompletedCount,
+        completedCount: nextCompletedCount
+      };
+
+      // 1. Update liveSubmissions and detailAssignment locally (NO stale handleSyncSubmissions call)
+      setLiveSubmissions(nextLiveSubmissions);
+      setDetailAssignment(cleanedDetailAssignment);
+
+      // 2. Clear selectedStudentDetail if it matches deleted student so stale answers are never shown
+      if (selectedStudentDetail && normalizeStudentCode(selectedStudentDetail.code) === targetNormCode) {
+        setSelectedStudentDetail(null);
+      }
+
+      // 3. Immediately update parent assignments list so "Đã làm" column & re-open stay 100% synced
+      try {
+        await Promise.resolve(onSaveAssignment(cleanedDetailAssignment));
+      } catch (saveErr) {
+        console.warn('Cảnh báo khi đồng bộ danh sách bài tập sau xóa:', saveErr);
+      }
+
+      // 4. Force submissionSyncTick increment to trigger recalculation of trackingStudentsList
       setSubmissionSyncTick(tick => tick + 1);
 
-      // 4. Also call handleSyncSubmissions to ensure complete state sync
-      await handleSyncSubmissions(false);
-
-      // 5. Show Toast notification on UI
-      showToast(`Đã xóa kết quả bài làm của ${targetName}`);
-
-      // 6. Close the delete target modal
+      // 5. Show Toast notification on UI and close confirmation modal
+      showToast(`Đã xóa sạch kết quả bài làm của ${targetName} (${targetNormCode})`);
       setDeleteTarget(null);
     } catch (err: any) {
-      console.error(`[Delete Submission Error] Lỗi khi xóa kết quả bài làm của ${targetName} (${targetCode}):`, err);
+      console.error(`[Delete Submission Error] Lỗi khi xóa kết quả bài làm của ${targetName} (${targetNormCode}):`, err);
       setDeleteError(err?.message || 'Không thể xóa kết quả bài làm. Vui lòng kiểm tra lại kết nối mạng!');
     } finally {
       setIsDeletingSubmission(false);
@@ -620,22 +649,25 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   // Helper calculating authentic unique submitted student count
   const getAssignmentSubmissionCount = useCallback((as: HomeworkAssignment): number => {
     if (!as) return 0;
+    const sourceAssign = (detailAssignment && detailAssignment.id === as.id) ? detailAssignment : as;
     const uniqueStudentKeys = new Set<string>();
 
     const addSubKey = (s: any) => {
-      if (!s) return;
-      const k = (s.studentCode || s.maHs || s.studentId || s.code || '').trim().toLowerCase();
+      if (!s || s.status === 'waiting') return;
+      const raw = s.studentCode || s.maHs || s.studentId || s.code || '';
+      const k = normalizeStudentCode(String(raw));
       if (k) uniqueStudentKeys.add(k);
     };
 
-    // 1. as.submissions
-    const subs = Array.isArray(as.submissions) ? as.submissions : [];
+    // 1. submissions array
+    const subs = Array.isArray(sourceAssign.submissions) ? sourceAssign.submissions : [];
     subs.forEach(addSubKey);
 
     // 2. submittedIds
-    if (Array.isArray(as.submittedIds)) {
-      as.submittedIds.forEach((id: string) => {
-        if (id) uniqueStudentKeys.add(id.trim().toLowerCase());
+    if (Array.isArray(sourceAssign.submittedIds)) {
+      sourceAssign.submittedIds.forEach((id: string) => {
+        const k = normalizeStudentCode(String(id || ''));
+        if (k) uniqueStudentKeys.add(k);
       });
     }
 
@@ -644,25 +676,25 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       liveSubmissions.forEach(addSubKey);
     }
 
-    // 4. Scan localStorage for students in targetClass
+    // 4. Scan localStorage for students in targetClass (strictly matching assignmentId)
     if (typeof window !== 'undefined' && as.targetClass) {
       const roster = getStudentsFromLocalStorage(as.targetClass) || [];
       roster.forEach(st => {
-        const keys = [st.code, st.id, st.username].filter(Boolean) as string[];
+        const keys = Array.from(new Set([st.code, normalizeStudentCode(st.code), st.id, st.username].filter(Boolean) as string[]));
         keys.forEach(k => {
           try {
             const raw = localStorage.getItem(`eduplay_k5_student_submissions_${k}`);
             if (raw) {
               const parsed = JSON.parse(raw);
               if (Array.isArray(parsed)) {
-                const matched = parsed.find((item: any) =>
-                  item.assignment?.id === as.id ||
-                  item.id === as.id ||
-                  item.assignmentId === as.id ||
-                  (item.title && item.title === as.title)
-                );
+                const matched = parsed.find((item: any) => {
+                  if (!item || item.status === 'waiting') return false;
+                  const aid = item.assignment?.id || item.assignmentId || item.id;
+                  if (!aid) return false;
+                  return aid === as.id || (as.originalAssignmentId && aid === as.originalAssignmentId);
+                });
                 if (matched) {
-                  addSubKey({ studentId: st.code, studentName: st.fullName || st.name });
+                  addSubKey({ studentCode: st.code, studentId: st.code });
                 }
               }
             }
@@ -683,61 +715,52 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     }
 
     if (uniqueStudentKeys.size > 0) return uniqueStudentKeys.size;
-    if (typeof as.submittedCount === 'number' && as.submittedCount > 0) return as.submittedCount;
-    if (typeof as.completedCount === 'number' && as.completedCount > 0) return as.completedCount;
+    if (Array.isArray(sourceAssign.submissions)) return 0;
+    if (typeof sourceAssign.submittedCount === 'number' && sourceAssign.submittedCount > 0) return sourceAssign.submittedCount;
+    if (typeof sourceAssign.completedCount === 'number' && sourceAssign.completedCount > 0) return sourceAssign.completedCount;
     return 0;
   }, [detailAssignment, liveSubmissions, submissionSyncTick]);
 
   // Dynamic tracking students derived from detailAssignment submissions and class roster
   const trackingStudentsList = useMemo(() => {
     if (!detailAssignment) return [];
-    
-    // Debug log as requested by user
-    console.log("Current Assignment ID querying:", detailAssignment.id);
 
     // Get authentic class students roster or default fallback
     const targetClassName = detailAssignment.targetClass || 'Lớp 5C';
     const classStudentsRoster = getStudentsFromLocalStorage(targetClassName) || [];
-    
+
     const subList: any[] = [
       ...(Array.isArray(detailAssignment.submissions) ? detailAssignment.submissions : []),
       ...liveSubmissions
     ].filter(sub => {
-      if (!sub) return false;
-      const assignId = sub.assignmentId || sub.assignment?.id || sub.id;
-      if (assignId && detailAssignment.id && assignId !== detailAssignment.id && !detailAssignment.id.includes(assignId) && !assignId.includes(detailAssignment.id)) {
+      if (!sub || sub.status === 'waiting') return false;
+      const assignId = sub.assignmentId || sub.assignment?.id;
+      if (assignId && detailAssignment.id && assignId !== detailAssignment.id && assignId !== detailAssignment.originalAssignmentId) {
         return false;
       }
       return true;
     });
-    const subMap = new Map<string, any>();
+    const codeSubMap = new Map<string, any>();
+    const idSubMap = new Map<string, any>();
 
     const indexSubmission = (sub: any) => {
-      if (!sub) return;
-      const candidates = [
-        sub.studentId,
-        sub.maHs,
-        sub.studentCode,
-        sub.code,
-        sub.username,
-        sub.userId,
-        sub.id
-      ];
-
-      candidates.forEach(cand => {
-        if (cand && typeof cand === 'string') {
-          const stdCode = normalizeStudentCode(cand);
-          if (stdCode) {
-            subMap.set(stdCode, sub);
-            subMap.set(stdCode.toLowerCase(), sub);
-          }
-          const clean = cand.trim().toUpperCase();
-          if (clean) {
-            subMap.set(clean, sub);
-            subMap.set(clean.toLowerCase(), sub);
-          }
-        }
+      if (!sub || sub.status === 'waiting') return;
+      const primaryCodes = [sub.studentCode, sub.maHs, sub.code].filter((c) => c && typeof c === 'string');
+      primaryCodes.forEach((cand) => {
+        const stdCode = normalizeStudentCode(cand);
+        if (stdCode) codeSubMap.set(stdCode, sub);
       });
+
+      const secondaryIds = [sub.studentId, sub.username, sub.userId].filter((c) => c && typeof c === 'string');
+      secondaryIds.forEach((cand) => {
+        const stdId = normalizeStudentCode(cand);
+        if (stdId) idSubMap.set(stdId, sub);
+      });
+
+      if (primaryCodes.length === 0 && secondaryIds.length === 0 && sub.id && typeof sub.id === 'string' && !sub.id.startsWith('as-')) {
+        const stdDocId = normalizeStudentCode(sub.id.replace(/^sub-/i, ''));
+        if (stdDocId) idSubMap.set(stdDocId, sub);
+      }
     };
 
     // Index all existing submissions on detailAssignment and liveSubmissions
@@ -746,13 +769,14 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     // Also scan localStorage for submissions of each student in this class (strictly matching assignmentId)
     if (typeof window !== 'undefined') {
       classStudentsRoster.forEach(st => {
-        const storageKeysToCheck = [
+        const storageKeysToCheck = Array.from(new Set([
           st.code,
+          normalizeStudentCode(st.code),
           st.id,
           st.username,
           st.code?.toLowerCase(),
           st.id?.toLowerCase()
-        ].filter(Boolean) as string[];
+        ].filter(Boolean) as string[]));
 
         for (const sk of storageKeysToCheck) {
           try {
@@ -761,16 +785,19 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
               const parsed = JSON.parse(raw);
               if (Array.isArray(parsed)) {
                 const matched = parsed.find((item: any) => {
-                  const aid = item.assignment?.id || item.id || item.assignmentId;
-                  return aid === detailAssignment.id || (detailAssignment.id && aid && (detailAssignment.id.includes(aid) || aid.includes(detailAssignment.id)));
+                  if (!item || item.status === 'waiting') return false;
+                  const aid = item.assignment?.id || item.assignmentId || item.id;
+                  if (!aid) return false;
+                  return aid === detailAssignment.id || (detailAssignment.originalAssignmentId && aid === detailAssignment.originalAssignmentId);
                 });
                 if (matched) {
+                  const normCode = normalizeStudentCode(st.code || sk);
                   const localSub = {
-                    id: matched.id || `sub-${st.code}`,
+                    id: matched.id || `sub-${normCode}`,
                     assignmentId: detailAssignment.id,
-                    studentId: st.code,
-                    studentCode: st.code,
-                    maHs: st.code,
+                    studentId: normCode,
+                    studentCode: normCode,
+                    maHs: normCode,
                     studentName: st.fullName || st.name,
                     score: matched.score !== undefined ? matched.score : (matched.totalScore !== undefined ? matched.totalScore : '-'),
                     totalScore: matched.totalScore !== undefined ? matched.totalScore : (matched.score !== undefined ? matched.score : '-'),
@@ -793,24 +820,41 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     const questionCount = questions.length > 0 ? questions.length : 5;
 
     const resultList = classStudentsRoster.map((st, idx) => {
-      const lookupKeys = [
-        st.code,
-        st.id,
-        st.username,
+      const codeKeys = Array.from(new Set([
         normalizeStudentCode(st.code),
+        normalizeStudentCode(formatStandardStudentCode(st.code, targetClassName)),
+        st.code?.trim().toUpperCase()
+      ].filter(Boolean) as string[]));
+      const idKeys = Array.from(new Set([
         normalizeStudentCode(st.id),
-        formatStandardStudentCode(st.code, targetClassName),
-        formatStandardStudentCode(st.id, targetClassName),
-        st.code?.toLowerCase(),
-        st.id?.toLowerCase(),
-        st.username?.toLowerCase()
-      ].filter(Boolean) as string[];
+        normalizeStudentCode(st.username)
+      ].filter(Boolean) as string[]));
 
       let submission: any = null;
-      for (const k of lookupKeys) {
-        if (subMap.has(k)) {
-          submission = subMap.get(k);
+      for (const k of codeKeys) {
+        if (codeSubMap.has(k)) {
+          submission = codeSubMap.get(k);
           break;
+        }
+      }
+      if (!submission) {
+        for (const k of codeKeys) {
+          if (idSubMap.has(k)) {
+            submission = idSubMap.get(k);
+            break;
+          }
+        }
+      }
+      if (!submission) {
+        for (const k of idKeys) {
+          if (codeSubMap.has(k)) {
+            submission = codeSubMap.get(k);
+            break;
+          }
+          if (idSubMap.has(k)) {
+            submission = idSubMap.get(k);
+            break;
+          }
         }
       }
 
@@ -3953,6 +3997,8 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                   Bài tập: <span className="font-extrabold text-slate-800">{detailAssignment.title || 'Bài tập: Luyện tập: bài 1: Tự nhiên và công nghệ'}</span>
                   <span className="mx-2 text-slate-300">•</span>
                   Sĩ số {detailAssignment.targetClass ? (detailAssignment.targetClass.startsWith('Lớp') ? detailAssignment.targetClass : `Lớp ${detailAssignment.targetClass}`) : 'Lớp 5C'}: <span className="font-extrabold text-indigo-900">{trackingStudentsList.length || (detailAssignment.targetClass ? getClassStudentCount(detailAssignment.targetClass, detailAssignment.totalStudents) : (detailAssignment.totalStudents || 38))} học sinh</span>
+                  <span className="mx-2 text-slate-300">•</span>
+                  Đã làm: <span className="font-extrabold text-emerald-700">{trackingStudentsList.filter(s => s.status === 'submitted').length}/{trackingStudentsList.length || (detailAssignment.targetClass ? getClassStudentCount(detailAssignment.targetClass, detailAssignment.totalStudents) : (detailAssignment.totalStudents || 38))}</span>
                 </p>
               </div>
 

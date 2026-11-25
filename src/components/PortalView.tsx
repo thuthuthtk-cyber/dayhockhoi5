@@ -20,6 +20,7 @@ import {
 } from '../services/studentStorageService';
 import { resolveTeacherNameByEmail, getCurrentTeacherProfile, verifyTeacherAuthorization } from '../services/teacherStorageService';
 import { useClassesList, normalizeClassKeyStrict, formatClassName } from '../services/classStorageService';
+import { normalizeStudentCode } from '../services/studentCode';
 import { getStudentAvatarSource } from './common/AnimalAvatars';
 
 interface PortalViewProps {
@@ -462,8 +463,12 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
   const saveStudentSession = (student: StudentRecord) => {
     try {
       const cls = student?.className || selectedClass || 'Lớp 5C';
+      const normalizedCode = normalizeStudentCode(
+        student?.studentCode || student?.code || (student as any)?.maHs || student?.username || student?.id || ''
+      );
       const studentWithClass = {
         ...student,
+        ...(normalizedCode ? { studentCode: normalizedCode, code: student?.code || normalizedCode, maHs: normalizedCode } : {}),
         className: cls,
         class: cls,
         classId: cls,

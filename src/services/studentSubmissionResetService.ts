@@ -6,13 +6,18 @@ import {
   updateDoc, 
   collection, 
   getDocs, 
-  deleteField 
+  deleteField,
+  query,
+  where
 } from 'firebase/firestore';
-import { normalizeStudentCode, normalizeStudentName } from './studentCode';
+import { normalizeStudentCode, normalizeStudentName, getStudentCodeLookupVariants } from './studentCode';
 import { deleteExamDraft } from './examDraftService';
 import { invalidateAllSubmissionsCache } from './hocBaDataService';
 import { normalizeClassKey } from './studentSessionService';
 import { backupSubmissionBeforeDelete } from './unmatchedSubmissionsService';
+import { studentResultService } from './studentResultService';
+import { removeStudentSubmissionFromAssignment } from './assignmentStorageService';
+import { clearMemoryTrackingData, clearIndexedDBTrackingData } from './assignmentTrackingData';
 
 export interface ResetSubmissionOptions {
   studentCode: string;
@@ -438,11 +443,12 @@ export interface ResetAssignmentSubmissionOptions {
 
 /**
  * Xóa triệt để và đồng bộ toàn bộ dữ liệu bài làm của học sinh cho bài tập rèn luyện trên Firestore & LocalStorage
+ * Đối chiếu DUY NHẤT theo studentCode chuẩn hóa (KHÔNG phụ thuộc tên học sinh).
  */
 export async function resetOrDeleteStudentAssignmentSubmission(
   options: ResetAssignmentSubmissionOptions
 ): Promise<{ success: boolean; deletedCount: number }> {
-  const { studentCode, studentName, studentId, assignmentId, originalAssignmentId, targetClass } = options;
+  const { studentCode, studentId, assignmentId, originalAssignmentId, targetClass } = options;
   const normCode = normalizeStudentCode(studentCode || studentId || '');
   if (!normCode) {
     throw new Error('Mã học sinh không hợp lệ.');
@@ -451,176 +457,189 @@ export async function resetOrDeleteStudentAssignmentSubmission(
     throw new Error('Mã bài tập không hợp lệ.');
   }
 
-  const normName = studentName ? normalizeStudentName(studentName) : '';
-  const classKey = normalizeClassKey(targetClass || '').toLowerCase();
-  const assignBaseId = (originalAssignmentId || assignmentId || '').replace(/^as-/, '').replace(/^ex-/, '').replace(/-class-.*$/, '');
-
-  const candDocIds = Array.from(new Set([
-    assignmentId,
-    `as-${assignBaseId}-class-${classKey}`,
-    `as-${assignBaseId}-class-lp${classKey}`,
-    originalAssignmentId
-  ].filter(Boolean) as string[]));
-
   let deletedCount = 0;
 
+  // 1. Xóa trong assignments/{id}/submissions, master doc `assignments/{id}` & `eduplay_k5_cached_assignments`
+  const assignResult = await removeStudentSubmissionFromAssignment(
+    assignmentId,
+    normCode,
+    originalAssignmentId,
+    targetClass
+  );
+  deletedCount += assignResult.deletedCount;
+  const candDocIds = assignResult.candDocIds.length > 0
+    ? assignResult.candDocIds
+    : Array.from(new Set([assignmentId, originalAssignmentId].filter(Boolean) as string[]));
+  const candSetLower = new Set(candDocIds.map((c) => c.toLowerCase()));
+
+  const isMatchingAssignmentItem = (item: any): boolean => {
+    if (!item || typeof item !== 'object') return false;
+    const itemAssignIds = [item.assignmentId, item.assignment?.id, item.id, item.examId]
+      .filter(Boolean)
+      .map((v) => String(v).trim().toLowerCase());
+    return itemAssignIds.some((aid) => candSetLower.has(aid));
+  };
+
   if (db) {
-    for (const docId of candDocIds) {
-      try {
-        const subColRef = collection(db, 'assignments', docId, 'submissions');
-        const subSnap = await getDocs(subColRef);
-
-        const deletePromises: Promise<any>[] = [];
-        subSnap.forEach((docSnap) => {
-          const data = docSnap.data();
-          const docCode = normalizeStudentCode(data.studentCode || data.code || data.maHs || data.studentId || '');
-          const docIdStr = docSnap.id.toLowerCase();
-          const targetLower = normCode.toLowerCase();
-
-          const isIdMatch = docIdStr === targetLower ||
-                            docIdStr.startsWith(`${targetLower}_`) ||
-                            docIdStr.startsWith(`sub-${docId.toLowerCase()}-${targetLower}`) ||
-                            docIdStr.includes(targetLower);
-
-          const isCodeMatch = Boolean(docCode && docCode === normCode);
-          const isNameMatch = Boolean(
-            normName && 
-            normalizeStudentName(data.studentName || data.name || '') === normName
-          );
-
-          if (isIdMatch || isCodeMatch || isNameMatch) {
-            deletePromises.push(
-              deleteDoc(doc(db, 'assignments', docId, 'submissions', docSnap.id))
-                .then(() => { deletedCount++; })
-                .catch(() => {})
-            );
-          }
-        });
-
-        deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', normCode)).catch(() => {}));
-        deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', `${normCode}_${docId}_1`)).catch(() => {}));
-        deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', `sub-${docId}-${normCode}`)).catch(() => {}));
-
-        await Promise.all(deletePromises);
-
-        const masterRef = doc(db, 'assignments', docId);
-        const masterSnap = await getDoc(masterRef);
-        if (masterSnap.exists()) {
-          const masterData = masterSnap.data();
-          if (Array.isArray(masterData.submissions)) {
-            const filteredSubs = masterData.submissions.filter((s: any) => {
-              if (!s) return false;
-              const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-              const sId = String(s.id || '').toLowerCase();
-              const sName = normalizeStudentName(s.studentName || s.name || '');
-
-              if (sCode === normCode) return false;
-              if (sId.includes(normCode.toLowerCase())) return false;
-              if (normName && sName === normName) return false;
-              return true;
-            });
-
-            const uniqueStudentKeys = new Set(
-              filteredSubs.map((s: any) => (s.studentId || s.studentCode || s.maHs || s.studentName || '').trim().toLowerCase()).filter(Boolean)
-            );
-            const count = uniqueStudentKeys.size;
-
-            await updateDoc(masterRef, {
-              submissions: filteredSubs,
-              submittedIds: Array.from(uniqueStudentKeys),
-              completedCount: count,
-              submittedCount: count,
-              updatedAt: new Date().toISOString()
-            });
-          }
-        }
-      } catch (err: any) {
-        console.error(`Lỗi khi dọn dẹp Firestore cho assignment ${docId}:`, err);
-        throw new Error(`Lỗi cơ sở dữ liệu: ${err?.message || 'Không thể xóa bài làm'}`);
-      }
+    // 2. Truy vấn và xóa vĩnh viễn tất cả bản ghi kết quả trong `student_results` bằng where() & deleteDoc
+    try {
+      const srDelRes = await studentResultService.deleteAssignmentResult(
+        normCode,
+        assignmentId,
+        originalAssignmentId
+      );
+      deletedCount += srDelRes.deletedCount;
+    } catch (srErr) {
+      console.warn('Lỗi xóa student_results khi xóa bài tập:', srErr);
     }
 
+    // 3. Dọn thêm nếu có bản ghi lạc sang collection `submissions` gốc (dùng where() theo studentCode)
     try {
-      const srDocRef = doc(db, 'student_results', normCode);
-      const srSnap = await getDoc(srDocRef);
-      if (srSnap.exists()) {
-        const data = srSnap.data();
-        const assignmentsMap = data.assignments || {};
-        let modified = false;
-        for (const docId of candDocIds) {
-          if (assignmentsMap[docId]) {
-            delete assignmentsMap[docId];
-            modified = true;
-          }
-        }
-        if (modified) {
-          await updateDoc(srDocRef, {
-            assignments: assignmentsMap,
-            updatedAt: new Date().toISOString()
-          });
-        }
+      const variants = Array.from(
+        new Set([normCode, ...getStudentCodeLookupVariants(studentCode || normCode)].filter(Boolean))
+      ).slice(0, 10);
+      for (const field of ['studentCode', 'studentId', 'maHs'] as const) {
+        try {
+          const subsColRef = collection(db, 'submissions');
+          const qSubs = variants.length > 1
+            ? query(subsColRef, where(field, 'in', variants))
+            : query(subsColRef, where(field, '==', normCode));
+          const subsSnap = await getDocs(qSubs);
+          await Promise.allSettled(
+            subsSnap.docs.map(async (d) => {
+              const data = d.data() || {};
+              const dCode = normalizeStudentCode(data.studentCode || data.maHs || data.studentId || data.code || '');
+              if (dCode !== normCode) return;
+              if (isMatchingAssignmentItem(data)) {
+                await deleteDoc(doc(db, 'submissions', d.id)).catch(() => {});
+                deletedCount++;
+              }
+            })
+          );
+        } catch {}
       }
-    } catch (srErr) {
-      console.warn('Lỗi cập nhật student_results khi xóa bài tập:', srErr);
+    } catch (rootSubErr) {
+      console.warn('Lỗi kiểm tra collection submissions khi xóa bài tập:', rootSubErr);
     }
   }
 
+  // 4. Dọn dẹp triệt để toàn bộ cache LocalStorage liên quan
   if (typeof window !== 'undefined') {
     try {
-      const studentKeys = [normCode, studentId, studentCode].filter(Boolean) as string[];
-      studentKeys.forEach(k => {
-        localStorage.removeItem(`eduplay_k5_student_submissions_${k}`);
-      });
+      const codeVariants = Array.from(
+        new Set([normCode, ...getStudentCodeLookupVariants(studentCode || normCode), studentId, studentCode].filter(Boolean) as string[])
+      );
 
-      const allSubsRaw = localStorage.getItem('eduplay_k5_all_assignment_submissions');
-      if (allSubsRaw) {
-        const allSubs = JSON.parse(allSubsRaw);
-        if (Array.isArray(allSubs)) {
-          const filtered = allSubs.filter((s: any) => {
-            const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-            const sAssignmentId = String(s.assignmentId || s.id || '').trim();
-            const isMatch = candDocIds.some(cid => sAssignmentId.includes(cid));
-            if (sCode === normCode && isMatch) return false;
+      // 4a. Dọn danh sách tổng hợp bài tập / bài thi
+      const globalKeys = ['eduplay_k5_all_assignment_submissions', 'eduplay_k5_all_exam_submissions'];
+      globalKeys.forEach((gKey) => {
+        try {
+          const raw = localStorage.getItem(gKey);
+          if (!raw) return;
+          const parsed = JSON.parse(raw);
+          if (!Array.isArray(parsed)) return;
+          const filtered = parsed.filter((s: any) => {
+            const sCode = normalizeStudentCode(s?.studentCode || s?.code || s?.maHs || s?.studentId || '');
+            if (sCode === normCode && isMatchingAssignmentItem(s)) return false;
             return true;
           });
-          localStorage.setItem('eduplay_k5_all_assignment_submissions', JSON.stringify(filtered));
-        }
-      }
+          localStorage.setItem(gKey, JSON.stringify(filtered));
+        } catch {}
+      });
 
+      // 4b. Dọn cache submissions theo từng assignmentId
+      candDocIds.forEach((docId) => {
+        try {
+          const examSubsKey = `eduplay_k5_exam_subs_${docId}`;
+          const raw = localStorage.getItem(examSubsKey);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              const filtered = parsed.filter((s: any) => {
+                const sCode = normalizeStudentCode(s?.studentCode || s?.code || s?.maHs || s?.studentId || '');
+                return sCode !== normCode;
+              });
+              localStorage.setItem(examSubsKey, JSON.stringify(filtered));
+            }
+          }
+        } catch {}
+      });
+
+      // 4c. Quét tất cả key submissions của học sinh và lọc bỏ chính xác bài tập đã xóa
+      const prefixes = [
+        'eduplay_k5_student_submissions_',
+        'eduplay_k5_student_homework_subs_',
+        'eduplay_k5_assignment_subs_',
+        'eduplay_k5_student_exam_subs_',
+        'eduplay_k5_student_exam_submissions_'
+      ];
+
+      const keysSnapshot: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
-        if (k && k.startsWith('eduplay_k5_student_submissions_')) {
-          const raw = localStorage.getItem(k);
-          if (raw) {
-            try {
-              const parsed = JSON.parse(raw);
-              if (Array.isArray(parsed)) {
-                const cleaned = parsed.filter((item: any) => {
-                  const itemAssignId = String(item.assignmentId || item.id || '');
-                  const itemCode = normalizeStudentCode(item.studentCode || item.code || item.maHs || item.studentId || '');
-                  const isMatch = candDocIds.some(cid => itemAssignId.includes(cid));
-                  if (itemCode === normCode && isMatch) return false;
-                  return true;
-                });
-                localStorage.setItem(k, JSON.stringify(cleaned));
-              }
-            } catch {}
-          }
-        }
+        if (k) keysSnapshot.push(k);
       }
+
+      keysSnapshot.forEach((k) => {
+        const matchedPrefix = prefixes.find((p) => k.startsWith(p));
+        if (!matchedPrefix) return;
+
+        const keySuffix = k.slice(matchedPrefix.length);
+        const keyCode = normalizeStudentCode(keySuffix);
+        const isKeyForStudent = codeVariants.some((v) => normalizeStudentCode(v) === keyCode) || keyCode === normCode;
+
+        try {
+          const raw = localStorage.getItem(k);
+          if (!raw) return;
+          const parsed = JSON.parse(raw);
+          if (!Array.isArray(parsed)) return;
+
+          const cleaned = parsed.filter((item: any) => {
+            if (!item) return false;
+            const itemCode = normalizeStudentCode(item.studentCode || item.code || item.maHs || item.studentId || '');
+            const belongsToStudent = itemCode ? itemCode === normCode : isKeyForStudent;
+            if (belongsToStudent && isMatchingAssignmentItem(item)) {
+              return false;
+            }
+            return true;
+          });
+
+          if (cleaned.length !== parsed.length) {
+            localStorage.setItem(k, JSON.stringify(cleaned));
+          }
+        } catch {}
+      });
     } catch (lsErr) {
       console.warn('Lỗi dọn LocalStorage khi xóa bài tập:', lsErr);
     }
   }
 
+  // 5. Xóa bộ nhớ tạm In-Memory & IndexedDB Tracking Cache + HocBa Cache
+  try {
+    candDocIds.forEach((cid) => clearMemoryTrackingData(cid));
+    await Promise.allSettled(candDocIds.map((cid) => clearIndexedDBTrackingData(cid)));
+  } catch {}
+
   try {
     invalidateAllSubmissionsCache();
   } catch {}
 
+  // 6. Broadcast sự kiện đồng bộ toàn hệ thống
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('eduplay_k5_student_submissions_updated'));
+    window.dispatchEvent(new Event('eduplay_k5_exam_submissions_updated'));
     window.dispatchEvent(new Event('eduplay_k5_assignments_updated'));
+    window.dispatchEvent(new Event('assignment-data-updated'));
     window.dispatchEvent(new Event('storage'));
+    window.dispatchEvent(
+      new CustomEvent('eduplay_k5_submission_reset', {
+        detail: {
+          studentCode: normCode,
+          assignmentId,
+          candDocIds
+        }
+      })
+    );
   }
 
   return { success: true, deletedCount };

@@ -1,14 +1,15 @@
 import { db, auth, ensureFirebaseAuthSessionWithStatus } from './firebase';
 import { signInAnonymously } from 'firebase/auth';
-import { collection, doc, getDocs, onSnapshot, query, where, Query } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, onSnapshot, query, where, updateDoc, deleteDoc, Query } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch, extractFirestoreErrorDetails } from './firestoreWriteTracker';
 import { HomeworkAssignment } from '../types';
 import { getCurrentTeacherProfile, resolveCurrentTeacherProfile } from './teacherStorageService';
 import { waitForWriteConfirmation, updateCollectionCacheStatus } from './firestoreWriteVerificationService';
 import { normalizeClassKey } from './studentStorageService';
-import { normalizeStudentCode } from './studentCode';
-import { sanitizeForFirestore, sanitizeFirestoreDocId } from '../utils/firestoreSanitizer';
+import { normalizeStudentCode, getStudentCodeLookupVariants } from './studentCode';
+import { sanitizeForFirestore, sanitizeFirestoreDocId, withFirestoreTimeout } from '../utils/firestoreSanitizer';
 import { isAdmin, getAllAccessibleClasses, canManageClass, UserPermissionsProfile } from '../utils/permissions';
+import { getAssignmentAttemptCountFromRecord } from './studentResultService';
 import './orderingMigrationService';
 
 async function ensureAssignAuth(): Promise<{ ok: boolean; error?: string; code?: string }> {
@@ -690,5 +691,354 @@ export async function deduplicateSubmissions(examId?: string): Promise<{ cleaned
     return { cleanedCount: 0, removedIds: [] };
   }
 }
+
+/**
+ * Truy vấn bài nộp và số lần đã làm của 1 học sinh theo studentCode chuẩn hóa (dùng where())
+ */
+export async function getStudentSubmissionsForAssignment(
+  assignmentId: string,
+  rawStudentCode: string,
+  originalAssignmentId?: string
+): Promise<{
+  hasSubmitted: boolean;
+  isGraded: boolean;
+  attemptsCount: number;
+  latestSubmission: any | null;
+}> {
+  const normalizedCode = normalizeStudentCode(rawStudentCode).slice(0, 64);
+  if (!assignmentId || !normalizedCode || !db) {
+    return { hasSubmitted: false, isGraded: false, attemptsCount: 0, latestSubmission: null };
+  }
+
+  try {
+    await ensureAssignAuth();
+
+    const variants = Array.from(
+      new Set([normalizedCode, ...getStudentCodeLookupVariants(rawStudentCode)].filter(Boolean))
+    ).slice(0, 10);
+
+    const assignIds = Array.from(
+      new Set([String(assignmentId).trim(), originalAssignmentId ? String(originalAssignmentId).trim() : ''].filter(Boolean))
+    );
+
+    let matchedSub: any = null;
+    let maxAttempts = 0;
+
+    for (const targetId of assignIds) {
+      try {
+        const subColRef = collection(db, 'assignments', targetId, 'submissions');
+        const q = variants.length > 1
+          ? query(subColRef, where('studentCode', 'in', variants))
+          : query(subColRef, where('studentCode', '==', normalizedCode));
+        const subSnap = await withFirestoreTimeout(getDocs(q), 6000, 'getStudentSubmissionsForAssignment.where');
+        subSnap.forEach((docSnap) => {
+          const data = docSnap.data();
+          if (!data) return;
+          const sCode = normalizeStudentCode(data.studentCode || data.maHs || data.studentId || data.code || '');
+          if (sCode && sCode !== normalizedCode) return;
+          const cAttempts = getAssignmentAttemptCountFromRecord(data);
+          if (cAttempts > maxAttempts) maxAttempts = cAttempts;
+          if (!matchedSub) matchedSub = { id: docSnap.id, ...data };
+        });
+      } catch (err) {
+        console.warn('[assignmentStorageService] Lỗi query where() submissions:', err);
+      }
+
+      if (!matchedSub) {
+        try {
+          const safeDocId = sanitizeFirestoreDocId(normalizedCode, 'hs');
+          const directSubSnap = await withFirestoreTimeout(
+            getDoc(doc(db, 'assignments', targetId, 'submissions', safeDocId)),
+            5000,
+            'getStudentSubmissionsForAssignment.getDocSub'
+          );
+          if (directSubSnap.exists()) {
+            const data = directSubSnap.data();
+            const sCode = normalizeStudentCode(data?.studentCode || data?.maHs || data?.studentId || data?.code || normalizedCode);
+            if (!sCode || sCode === normalizedCode) {
+              matchedSub = { id: directSubSnap.id, ...data };
+              maxAttempts = Math.max(maxAttempts, getAssignmentAttemptCountFromRecord(data), 1);
+            }
+          }
+        } catch {}
+      }
+
+      if (!matchedSub) {
+        try {
+          const parentSnap = await withFirestoreTimeout(
+            getDoc(doc(db, 'assignments', targetId)),
+            5000,
+            'getStudentSubmissionsForAssignment.getDocParent'
+          );
+          if (parentSnap.exists()) {
+            const subs = Array.isArray(parentSnap.data()?.submissions) ? parentSnap.data()!.submissions : [];
+            const foundInArray = subs.find((s: any) => {
+              const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || '');
+              return sCode === normalizedCode;
+            });
+            if (foundInArray) {
+              matchedSub = foundInArray;
+              maxAttempts = Math.max(maxAttempts, getAssignmentAttemptCountFromRecord(foundInArray), 1);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    const hasSubmitted = Boolean(matchedSub) || maxAttempts > 0;
+    const isGraded = Boolean(
+      matchedSub && (
+        matchedSub.graded === true ||
+        matchedSub.status === 'graded' ||
+        matchedSub.status === 'submitted' ||
+        (matchedSub.score !== undefined && matchedSub.score !== null && matchedSub.score !== '-') ||
+        (matchedSub.totalScore !== undefined && matchedSub.totalScore !== null && matchedSub.totalScore !== '-')
+      )
+    );
+
+    return {
+      hasSubmitted,
+      isGraded,
+      attemptsCount: hasSubmitted ? Math.max(1, maxAttempts) : 0,
+      latestSubmission: matchedSub
+    };
+  } catch (err) {
+    console.warn('[assignmentStorageService] Lỗi kiểm tra bài nộp học sinh:', err);
+    return { hasSubmitted: false, isGraded: false, attemptsCount: 0, latestSubmission: null };
+  }
+}
+
+/**
+ * Xóa sạch bài nộp & thống kê của 1 studentCode chuẩn hóa khỏi `assignments/{id}/submissions`,
+ * master doc `assignments/{id}`, và cache `eduplay_k5_cached_assignments` (KHÔNG đối chiếu theo tên).
+ */
+export async function removeStudentSubmissionFromAssignment(
+  assignmentId: string,
+  rawStudentCode: string,
+  originalAssignmentId?: string,
+  targetClass?: string
+): Promise<{ deletedCount: number; candDocIds: string[]; updatedAssignment: HomeworkAssignment | null }> {
+  const normCode = normalizeStudentCode(rawStudentCode).slice(0, 64);
+  if (!assignmentId || !normCode) {
+    return { deletedCount: 0, candDocIds: [], updatedAssignment: null };
+  }
+
+  const classKey = normalizeClassKey(targetClass || '').toLowerCase();
+  const assignBaseId = (originalAssignmentId || assignmentId || '')
+    .replace(/^as-/, '')
+    .replace(/^ex-/, '')
+    .replace(/-class-.*$/, '');
+
+  const candDocIds = Array.from(
+    new Set(
+      [
+        assignmentId,
+        classKey ? `as-${assignBaseId}-class-${classKey}` : '',
+        classKey ? `as-${assignBaseId}-class-lp${classKey}` : '',
+        originalAssignmentId
+      ].filter(Boolean) as string[]
+    )
+  );
+
+  const variants = Array.from(
+    new Set([normCode, ...getStudentCodeLookupVariants(rawStudentCode)].filter(Boolean))
+  ).slice(0, 10);
+
+  let deletedCount = 0;
+  let updatedAssignment: HomeworkAssignment | null = null;
+
+  const isSubForStudent = (sub: any, docId?: string): boolean => {
+    if (!sub && !docId) return false;
+    const codes = [
+      sub?.studentCode,
+      sub?.maHs,
+      sub?.studentId,
+      sub?.code
+    ]
+      .filter(Boolean)
+      .map((c) => normalizeStudentCode(String(c)));
+    if (codes.some((c) => c === normCode)) return true;
+
+    if (docId) {
+      const safeDocId = sanitizeFirestoreDocId(docId, 'hs').toLowerCase();
+      const normLower = normCode.toLowerCase();
+      const safeNormLower = sanitizeFirestoreDocId(normCode, 'hs').toLowerCase();
+      if (
+        safeDocId === normLower ||
+        safeDocId === safeNormLower ||
+        safeDocId.startsWith(`${normLower}_`) ||
+        safeDocId.startsWith(`${safeNormLower}_`)
+      ) {
+        return true;
+      }
+      if (candDocIds.some((cid) => safeDocId === `sub-${cid.toLowerCase()}-${normLower}`)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (db) {
+    try {
+      await ensureAssignAuth();
+
+      for (const docId of candDocIds) {
+        try {
+          const subColRef = collection(db, 'assignments', docId, 'submissions');
+          const subIdsToDelete = new Set<string>();
+
+          // 1. Truy vấn subcollection bằng where() theo studentCode / studentId / maHs
+          for (const field of ['studentCode', 'studentId', 'maHs'] as const) {
+            try {
+              const qSub = variants.length > 1
+                ? query(subColRef, where(field, 'in', variants))
+                : query(subColRef, where(field, '==', normCode));
+              const qSnap = await withFirestoreTimeout(getDocs(qSub), 6000, `removeSub.where.${field}`);
+              qSnap.forEach((d) => {
+                if (isSubForStudent(d.data(), d.id)) {
+                  subIdsToDelete.add(d.id);
+                }
+              });
+            } catch {}
+          }
+
+          // 2. Quét bổ sung phòng trường hợp bản ghi cũ không đánh index trường chuẩn
+          try {
+            const allSnap = await withFirestoreTimeout(getDocs(subColRef), 6000, 'removeSub.all');
+            allSnap.forEach((d) => {
+              if (isSubForStudent(d.data(), d.id)) {
+                subIdsToDelete.add(d.id);
+              }
+            });
+          } catch {}
+
+          // 3. Bổ sung các ID tài liệu theo biến thể mã học sinh
+          variants.forEach((v) => {
+            subIdsToDelete.add(v);
+            subIdsToDelete.add(sanitizeFirestoreDocId(v, 'hs'));
+            subIdsToDelete.add(`${v}_${docId}_1`);
+            subIdsToDelete.add(`sub-${docId}-${v}`);
+          });
+
+          await Promise.allSettled(
+            Array.from(subIdsToDelete).map(async (subDocId) => {
+              try {
+                await withFirestoreTimeout(
+                  deleteDoc(doc(db, 'assignments', docId, 'submissions', subDocId)),
+                  5000,
+                  'removeSub.deleteDoc'
+                );
+                deletedCount++;
+              } catch {}
+            })
+          );
+
+          // 4. Cập nhật mảng submissions & thống kê trên master document assignments/{docId}
+          try {
+            const masterRef = doc(db, 'assignments', docId);
+            const masterSnap = await withFirestoreTimeout(getDoc(masterRef), 6000, 'removeSub.getMaster');
+            if (masterSnap.exists()) {
+              const masterData = masterSnap.data() || {};
+              const existingSubs = Array.isArray(masterData.submissions) ? masterData.submissions : [];
+              const filteredSubs = existingSubs.filter((s: any) => !isSubForStudent(s, s?.id));
+
+              const uniqueStudentKeys = new Set(
+                filteredSubs
+                  .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || ''))
+                  .filter(Boolean)
+              );
+
+              const existingSubmittedIds = Array.isArray(masterData.submittedIds) ? masterData.submittedIds : [];
+              const filteredSubmittedIds = existingSubmittedIds.filter(
+                (id: any) => normalizeStudentCode(String(id || '')) !== normCode
+              );
+              filteredSubmittedIds.forEach((id: any) => {
+                const n = normalizeStudentCode(String(id || ''));
+                if (n) uniqueStudentKeys.add(n);
+              });
+
+              const finalSubmittedIds = Array.from(uniqueStudentKeys);
+              const count = finalSubmittedIds.length;
+
+              await withFirestoreTimeout(
+                updateDoc(masterRef, {
+                  submissions: filteredSubs,
+                  submittedIds: finalSubmittedIds,
+                  completedCount: count,
+                  submittedCount: count,
+                  updatedAt: new Date().toISOString()
+                }),
+                8000,
+                'removeSub.updateMaster'
+              );
+
+              if (docId === assignmentId) {
+                updatedAssignment = {
+                  id: masterSnap.id,
+                  ...(masterData as any),
+                  submissions: filteredSubs,
+                  submittedIds: finalSubmittedIds,
+                  completedCount: count,
+                  submittedCount: count
+                } as HomeworkAssignment;
+              }
+            }
+          } catch (masterErr) {
+            console.warn(`[assignmentStorageService] Lỗi cập nhật master doc ${docId}:`, masterErr);
+          }
+        } catch (err) {
+          console.warn(`[assignmentStorageService] Lỗi xử lý xóa bài nộp trong ${docId}:`, err);
+        }
+      }
+    } catch (outerErr) {
+      console.warn('[assignmentStorageService] Lỗi removeStudentSubmissionFromAssignment:', outerErr);
+    }
+  }
+
+  // 5. Cập nhật cache LocalStorage `eduplay_k5_cached_assignments`
+  if (typeof window !== 'undefined') {
+    try {
+      const cached = getLocalCachedAssignments();
+      if (cached.length > 0) {
+        const candSet = new Set(candDocIds);
+        const nextCached = cached.map((as) => {
+          if (!as || !candSet.has(as.id)) return as;
+          const existingSubs = Array.isArray(as.submissions) ? as.submissions : [];
+          const filteredSubs = existingSubs.filter((s: any) => !isSubForStudent(s, s?.id));
+          const uniqueKeys = new Set(
+            filteredSubs
+              .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || ''))
+              .filter(Boolean)
+          );
+          const filteredSubmittedIds = (Array.isArray(as.submittedIds) ? as.submittedIds : [])
+            .filter((id: any) => normalizeStudentCode(String(id || '')) !== normCode);
+          filteredSubmittedIds.forEach((id: any) => {
+            const n = normalizeStudentCode(String(id || ''));
+            if (n) uniqueKeys.add(n);
+          });
+          const count = uniqueKeys.size;
+          const nextAs = {
+            ...as,
+            submissions: filteredSubs,
+            submittedIds: Array.from(uniqueKeys),
+            completedCount: count,
+            submittedCount: count
+          };
+          if (as.id === assignmentId && !updatedAssignment) {
+            updatedAssignment = nextAs;
+          }
+          return nextAs;
+        });
+        saveAssignmentsToLocalStorage(nextCached);
+      }
+    } catch (lsErr) {
+      console.warn('[assignmentStorageService] Lỗi dọn cache cached_assignments:', lsErr);
+    }
+  }
+
+  return { deletedCount, candDocIds, updatedAssignment };
+}
+
+
 
 

@@ -43,7 +43,8 @@ import {
 } from '../../services/liveQuizSessionService';
 import { getStudentGameProfile } from '../../services/studentGameStoreService';
 import { getEffectiveStudentClassAndGrade, getCurrentStudentSession, getAuthenticStudentCode, normalizeClassKey } from '../../services/studentSessionService';
-import { studentResultService } from '../../services/studentResultService';
+import { studentResultService, getAssignmentAttemptCountFromRecord } from '../../services/studentResultService';
+import { getStudentSubmissionsForAssignment } from '../../services/assignmentStorageService';
 import { normalizeStudentCode, formatStandardStudentCode, normalizeStudentName, getRecordType } from '../../services/studentCode';
 import { saveExamDraft, deleteExamDraft, loadAllActiveDraftsForStudent, ExamDraftRecord } from '../../services/examDraftService';
 import { generateRuleBasedExamComment } from '../../services/studentCommentAiService';
@@ -2219,15 +2220,15 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
     };
   }, [todoExams, filteredExamHistory]);
 
-  const handleStartExam = (exam: ExamPaper) => {
+  const handleStartExam = async (exam: ExamPaper) => {
     const isAssignment = mode === 'assignment' || 
       (exam.title && (exam.title.toLowerCase().includes('bài tập') || exam.title.toLowerCase().includes('luyện tập') || exam.title.toLowerCase().includes('rèn luyện'))) ||
       exam.examType === 'Luyện tập' ||
       exam.examType === 'Bài tập';
-    const canRetake = allowMultipleAttempts !== undefined ? allowMultipleAttempts : isAssignment;
+    const canRetake = allowMultipleAttempts !== undefined ? allowMultipleAttempts : false;
 
     const isSubmitted = filteredExamHistory.some(sub => isExamSubmissionMatch(sub, exam));
-    const currentStatus = getExamStatus(exam, isSubmitted, new Date());
+    const currentStatus = getExamStatus(exam, isSubmitted && !canRetake, new Date());
 
     if (currentStatus === 'closed') {
       setAlertModal({
@@ -2247,8 +2248,8 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
       return;
     }
 
-    // Nếu học sinh đã nộp rồi: vào thẳng giao diện xem kết quả, không cho làm lại, không hiện nút Nộp bài
-    if (isSubmitted) {
+    // Nếu học sinh đã nộp rồi và không được làm lại: vào thẳng giao diện xem kết quả, không cho làm lại
+    if (isSubmitted && !canRetake) {
       const existingSub = filteredExamHistory.find(sub => isExamSubmissionMatch(sub, exam));
       setToast({
         message: 'Em đã nộp bài này rồi!',
@@ -2264,6 +2265,35 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
         rank: existingSub?.rank || 'Hoàn thành'
       });
       return;
+    }
+
+    // Kiểm tra trực tiếp Firestore student_results & submissions bằng studentCode chuẩn hóa nếu chỉ được làm 1 lần
+    if (!isPreviewMode && db && (mode === 'assignment' || isAssignment) && !canRetake && authenticStudentCode && exam.id) {
+      try {
+        const [resLookup, subLookup] = await Promise.all([
+          studentResultService.getStudentAssignmentResult(authenticStudentCode, exam.id, exam.originalExamId),
+          getStudentSubmissionsForAssignment(exam.id, authenticStudentCode, exam.originalExamId)
+        ]);
+        if (resLookup.found || subLookup.hasSubmitted) {
+          const remoteRec = resLookup.result || subLookup.latestSubmission;
+          setToast({
+            message: '🔒 Bài tập này chỉ được làm 1 lần và em đã hoàn thành / đã chấm điểm!',
+            type: 'warning'
+          });
+          setDetailSubmission({
+            exam,
+            score: remoteRec?.score !== undefined ? String(remoteRec.score) : (remoteRec?.totalScore !== undefined ? String(remoteRec.totalScore) : 'Hoàn thành'),
+            time: formatSubmissionDateTime(remoteRec?.submittedAt || remoteRec?.submittedTime || getCurrentSubmissionTimestamp()),
+            answers: remoteRec?.answers || remoteRec?.lastAttempt?.answers || {},
+            title: exam.title,
+            subject: exam.subject || 'Môn học',
+            rank: remoteRec?.rank || 'Hoàn thành'
+          });
+          return;
+        }
+      } catch (err) {
+        console.warn('[StudentExamModule] Lỗi kiểm tra student_results trước khi làm bài:', err);
+      }
     }
 
     // Reset Proctoring Violation State & Submission flags
@@ -2470,7 +2500,8 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           throw new Error('Không xác định được mã bài làm (examId/assignmentId).');
         }
 
-        const attemptNumber = 1;
+        const canRetake = allowMultipleAttempts === true;
+        let attemptNumber = 1;
         const safeStudentDocId = sanitizeFirestoreDocId(authenticStudentCode, 'hs');
         const fixedDocId = sanitizeFirestoreDocId(`${safeStudentDocId}_${officialExamId}`, safeStudentDocId);
         const pendingSyncKey = getPendingSyncStorageKey(authenticStudentCode, officialExamId);
@@ -2489,6 +2520,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           studentCode: authenticStudentCode,
           maHs: authenticStudentCode,
           attemptNumber,
+          attemptsCount: attemptNumber,
           sddcn: session?.sddcn || authenticStudentCode,
           studentPersistentId: authenticStudentCode,
           academicYear: effectiveAcademicYear,
@@ -2544,14 +2576,16 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           totalQuestions: totalQ,
           submittedAt: nowTimeStr,
           submittedTime: nowTimeStr,
-          attempts: 1,
+          attempts: attemptNumber,
+          attemptsCount: attemptNumber,
+          graded: true,
           exam: compactExamMeta,
           assignment: isAssignment ? compactExamMeta : null,
           questionSnapshot: qSnapshot,
           questionResults,
           answers,
           answersById,
-          status: 'submitted' as const,
+          status: 'graded' as const,
           feedback: feedbackText
         });
 
@@ -2573,11 +2607,14 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           submittedTime: nowTimeStr,
           title: String(exam.title || 'Bài làm').slice(0, 500),
           subject: exam.subject || 'Môn học',
-          attempts: 1,
+          attempts: attemptNumber,
+          attemptsCount: attemptNumber,
+          attemptNumber,
+          graded: true,
           questionResults,
           answers,
           answersById,
-          status: 'submitted' as const,
+          status: 'graded' as const,
           feedback: feedbackText
         });
 
@@ -2644,6 +2681,10 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                 correctCount: Math.round(correct),
                 totalQuestions: totalQ,
                 submittedTime: nowTimeStr,
+                attemptsCount: attemptNumber,
+                attemptNumber,
+                status: 'graded',
+                graded: true,
                 assignment: examForLocalUi,
                 questionSnapshot: qSnapshot,
                 questionResults,
@@ -2687,28 +2728,43 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           ]));
 
           let foundExistingDoc: any = null;
+          let existingRemoteResult: any = null;
           if (!isRetry && !hasPendingLocalBackup) {
             try {
-              const existingChecks = await Promise.allSettled(
-                candDocIds.map(async (candId) => {
+              const existingChecks = await Promise.allSettled([
+                ...candDocIds.map(async (candId) => {
                   const candDocRef = doc(db, targetCol, officialExamId, 'submissions', candId);
                   const snap = await withFirestoreTimeout(getDoc(candDocRef), 4000, `checkExisting.${candId}`);
                   return snap.exists() ? snap.data() : null;
-                })
-              );
-              for (const res of existingChecks) {
+                }),
+                isAssignment
+                  ? studentResultService.getStudentAssignmentResult(authenticStudentCode, officialExamId, exam.originalExamId)
+                  : Promise.resolve(null)
+              ]);
+              for (let i = 0; i < candDocIds.length; i++) {
+                const res = existingChecks[i];
                 if (res.status === 'fulfilled' && res.value) {
                   foundExistingDoc = res.value;
                   break;
                 }
+              }
+              const resultCheck = existingChecks[candDocIds.length];
+              if (resultCheck && resultCheck.status === 'fulfilled' && resultCheck.value && (resultCheck.value as any).found) {
+                existingRemoteResult = resultCheck.value;
               }
             } catch (checkErr) {
               console.warn('Tạm bỏ qua bước kiểm tra bài cũ do mạng chậm:', checkErr);
             }
           }
 
-          if (foundExistingDoc && !isRetry && !hasPendingLocalBackup) {
-            console.warn('⚠️ [executeSubmitExam] Học sinh đã có bản ghi bài nộp:', foundExistingDoc.id || fixedDocId);
+          const previousAttempts = Math.max(
+            getAssignmentAttemptCountFromRecord(foundExistingDoc),
+            existingRemoteResult ? Number(existingRemoteResult.attemptsCount || 0) : 0
+          );
+
+          if ((foundExistingDoc || existingRemoteResult) && !canRetake && !isRetry && !hasPendingLocalBackup) {
+            const lockedRecord = foundExistingDoc || existingRemoteResult?.result || {};
+            console.warn('⚠️ [executeSubmitExam] Học sinh đã có bản ghi bài nộp (bài chỉ cho phép 1 lần):', lockedRecord.id || fixedDocId);
             persistLocalSubmissionState(false);
             hasSubmittedRef.current = true;
             setSubmissionError(null);
@@ -2719,14 +2775,26 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
             });
             setDetailSubmission({
               exam,
-              score: foundExistingDoc.score !== undefined ? String(foundExistingDoc.score) : scoreVal,
-              time: formatSubmissionDateTime(foundExistingDoc.submittedAt || foundExistingDoc.submittedTime || nowTimeStr),
-              answers: foundExistingDoc.answers || answers,
+              score: lockedRecord.score !== undefined ? String(lockedRecord.score) : scoreVal,
+              time: formatSubmissionDateTime(lockedRecord.submittedAt || lockedRecord.submittedTime || nowTimeStr),
+              answers: lockedRecord.answers || answers,
               title: exam.title,
               subject: exam.subject || 'Môn học',
-              rank: foundExistingDoc.rank || rankTier
+              rank: lockedRecord.rank || rankTier
             });
             return;
+          }
+
+          if (canRetake && previousAttempts > 0) {
+            attemptNumber = previousAttempts + 1;
+            examSub.attemptNumber = attemptNumber;
+            (examSub as any).attemptsCount = attemptNumber;
+            fullExamRecord.attemptNumber = attemptNumber;
+            fullExamRecord.attempts = attemptNumber;
+            fullExamRecord.attemptsCount = attemptNumber;
+            slimExamRecord.attemptNumber = attemptNumber;
+            slimExamRecord.attempts = attemptNumber;
+            slimExamRecord.attemptsCount = attemptNumber;
           }
 
           const subDocKey = isAssignment ? safeStudentDocId : fixedDocId;
@@ -2742,6 +2810,8 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
             studentId: authenticStudentCode,
             maHs: authenticStudentCode,
             attemptNumber,
+            attempts: attemptNumber,
+            attemptsCount: attemptNumber,
             updatedAt: new Date().toISOString()
           });
 
@@ -2749,7 +2819,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           try {
             await withFirestoreTimeout(
               runTransaction(db, async (transaction) => {
-                if (!isRetry && !hasPendingLocalBackup) {
+                if (!canRetake && !isRetry && !hasPendingLocalBackup) {
                   const subSnap = await transaction.get(mainSubDocRef);
                   if (subSnap.exists()) {
                     throw new Error('ALREADY_SUBMITTED');
@@ -2759,7 +2829,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                 if (masterSnap.exists()) {
                   const currentData = masterSnap.data();
                   const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
-                  if (!isRetry && !hasPendingLocalBackup) {
+                  if (!canRetake && !isRetry && !hasPendingLocalBackup) {
                     const alreadyInDoc = existingSubs.some((s: any) => {
                       const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
                       return sCode === authenticStudentCode;
@@ -2801,7 +2871,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
             );
             primarySynced = true;
           } catch (txErr: any) {
-            if (txErr?.message === 'ALREADY_SUBMITTED' && !isRetry && !hasPendingLocalBackup) {
+            if (txErr?.message === 'ALREADY_SUBMITTED' && !canRetake && !isRetry && !hasPendingLocalBackup) {
               persistLocalSubmissionState(false);
               hasSubmittedRef.current = true;
               setSubmissionError(null);
@@ -2918,6 +2988,10 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                   score: scoreNumber,
                   maxScore: 10,
                   submittedAt: nowTimeStr,
+                  attemptNumber,
+                  attemptsCount: attemptNumber,
+                  allowRetry: canRetake,
+                  status: 'graded',
                   answers,
                   answersById,
                   questionResults,
@@ -2960,6 +3034,8 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           try {
             onSubmitted({
               ...examSub,
+              attemptNumber,
+              attemptsCount: attemptNumber,
               pendingFirestoreSync: false,
               syncedToFirestore: true,
               alreadySyncedToFirestore: true

@@ -48,6 +48,7 @@ export interface QuestionEvaluation {
   points: number;
   isCorrect: boolean;
   isAnswered: boolean;
+  evaluationState: 'pass' | 'fail' | 'none';
   studentChoice: any;
 }
 
@@ -99,41 +100,44 @@ export interface StudentSubmissionDetailModalProps {
  * Trích xuất câu trả lời của học sinh cho một câu hỏi cụ thể theo ID hoặc Index
  */
 export function extractStudentAnswer(q: QuestionItem, qIdx: number, sub: any): any {
-  if (!sub) return undefined;
+  if (!sub || sub.status === 'waiting') return undefined;
   const rawSub = sub.rawSubmission || sub;
+  if (!rawSub || rawSub.status === 'waiting') return undefined;
+
+  const cleanVal = (val: any) => (val === 'none' ? undefined : val);
 
   // 1. Ưu tiên đối chiếu theo question ID qua answersById
   if (rawSub.answersById && q.id && rawSub.answersById[q.id] !== undefined) {
-    return rawSub.answersById[q.id];
+    return cleanVal(rawSub.answersById[q.id]);
   }
   if (sub.answersById && q.id && sub.answersById[q.id] !== undefined) {
-    return sub.answersById[q.id];
+    return cleanVal(sub.answersById[q.id]);
   }
 
   // 2. Đối chiếu theo answers object (keyed by question ID hoặc index)
   const answersObj = rawSub.answers !== undefined ? rawSub.answers : sub.answers;
   if (answersObj && typeof answersObj === 'object' && !Array.isArray(answersObj)) {
     if (q.id && answersObj[q.id] !== undefined) {
-      return answersObj[q.id];
+      return cleanVal(answersObj[q.id]);
     }
     if (answersObj[qIdx] !== undefined) {
-      return answersObj[qIdx];
+      return cleanVal(answersObj[qIdx]);
     }
     if (answersObj[String(qIdx)] !== undefined) {
-      return answersObj[String(qIdx)];
+      return cleanVal(answersObj[String(qIdx)]);
     }
   }
 
   // 3. Đối chiếu theo answers mảng theo vị trí
   if (Array.isArray(answersObj) && answersObj[qIdx] !== undefined) {
-    return answersObj[qIdx];
+    return cleanVal(answersObj[qIdx]);
   }
 
   // 4. Dự phòng qua studentAnswers hoặc choices
   const alt = rawSub.studentAnswers || rawSub.choices;
   if (alt && typeof alt === 'object') {
-    if (q.id && alt[q.id] !== undefined) return alt[q.id];
-    if (alt[qIdx] !== undefined) return alt[qIdx];
+    if (q.id && alt[q.id] !== undefined) return cleanVal(alt[q.id]);
+    if (alt[qIdx] !== undefined) return cleanVal(alt[qIdx]);
   }
 
   return undefined;
@@ -173,10 +177,25 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                       studentSubmission?.rawSubmission?.studentCode || 
                       '';
 
-  const submittedTime = studentSubmission?.submittedTime || 
-                        studentSubmission?.submittedAt || 
-                        studentSubmission?.rawSubmission?.submittedAt || 
-                        getCurrentSubmissionTimestamp();
+  const isWaitingStudent = useMemo(() => {
+    if (!studentSubmission) return true;
+    if (studentSubmission.status === 'waiting') return true;
+    const rawSub = studentSubmission.rawSubmission;
+    if (!rawSub && (studentSubmission.totalScore === '-' || studentSubmission.totalScore === undefined) && studentSubmission.score === undefined) {
+      const ans = studentSubmission.answers;
+      if (!ans || (Array.isArray(ans) && ans.every((a: any) => a === 'none' || a === undefined || a === null || a === ''))) {
+        return true;
+      }
+    }
+    return false;
+  }, [studentSubmission]);
+
+  const submittedTime = isWaitingStudent
+    ? 'Chờ HS'
+    : (studentSubmission?.submittedTime || 
+       studentSubmission?.submittedAt || 
+       studentSubmission?.rawSubmission?.submittedAt || 
+       getCurrentSubmissionTimestamp());
 
   // 1. TẢI CÂU HỎI TỪ CHÍNH BÀI ĐÃ GIAO / ĐỀ KIỂM TRA ĐÓ
   useEffect(() => {
@@ -321,27 +340,52 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
         ? qDeclaredPoints
         : defaultPointPerQ;
 
+      if (isWaitingStudent) {
+        return {
+          questionId: q.id || `q-${qIdx}`,
+          questionIndex: qIdx,
+          question: q,
+          points,
+          isCorrect: false,
+          isAnswered: false,
+          evaluationState: 'none',
+          studentChoice: undefined
+        };
+      }
+
       const studentChoice = extractStudentAnswer(q, qIdx, rawSub);
 
       // Xác định học sinh đã làm câu này hay bỏ trống
-      const isAnswered = studentChoice !== undefined && studentChoice !== null && studentChoice !== '';
+      const isAnswered = studentChoice !== undefined && studentChoice !== null && studentChoice !== '' && studentChoice !== 'none';
 
       // Xác định trạng thái Đúng/Sai ban đầu
       let isCorrect = false;
+      let hasExplicitEval = false;
 
       // 1. Kiểm tra nếu bài nộp đã có sẵn kết quả chấm câu này
       if (Array.isArray(studentSubmission?.answers) && studentSubmission.answers[qIdx] !== undefined) {
         const recordedAns = studentSubmission.answers[qIdx];
         if (recordedAns === 'pass' || recordedAns === true) {
           isCorrect = true;
+          hasExplicitEval = true;
         } else if (recordedAns === 'fail' || recordedAns === false) {
           isCorrect = false;
+          hasExplicitEval = true;
+        } else if (recordedAns === 'none') {
+          isCorrect = false;
+          hasExplicitEval = false;
         } else if (isAnswered) {
           isCorrect = checkQuestionCorrectLocal(q, studentChoice);
+          hasExplicitEval = true;
         }
       } else if (isAnswered) {
         isCorrect = checkQuestionCorrectLocal(q, studentChoice);
+        hasExplicitEval = true;
       }
+
+      const evaluationState: 'pass' | 'fail' | 'none' = (!hasExplicitEval && !isAnswered)
+        ? 'none'
+        : (isCorrect ? 'pass' : 'fail');
 
       return {
         questionId: q.id || `q-${qIdx}`,
@@ -350,6 +394,7 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
         points,
         isCorrect,
         isAnswered,
+        evaluationState,
         studentChoice
       };
     });
@@ -357,12 +402,13 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
     setEvaluations(initialEvaluations);
     setHasChanges(false);
     setSaveSuccessMsg(null);
-  }, [resolvedQuestions, studentSubmission]);
+  }, [resolvedQuestions, studentSubmission, isWaitingStudent]);
 
   // 3. TÍNH TOÁN ĐIỂM SỐ NHẤT QUÁN 100% TỪ NGUỒN EVALUATIONS DUY NHẤT
   const stats = useMemo(() => {
     const totalCount = evaluations.length;
     const correctCount = evaluations.filter(e => e.isCorrect).length;
+    const hasEvaluatedAny = evaluations.some(e => e.evaluationState !== 'none');
     
     // Tổng điểm tính từ các câu đúng
     const totalPointsSum = evaluations.reduce((acc, e) => acc + (e.isCorrect ? e.points : 0), 0);
@@ -378,7 +424,8 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
       totalCount,
       correctCount,
       calculatedScore,
-      scoreOutOf10
+      scoreOutOf10,
+      hasEvaluatedAny
     };
   }, [evaluations]);
 
@@ -389,9 +436,11 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
     setEvaluations(prev => {
       const next = [...prev];
       if (next[index]) {
+        const nextCorrect = next[index].evaluationState === 'none' ? true : !next[index].isCorrect;
         next[index] = {
           ...next[index],
-          isCorrect: !next[index].isCorrect
+          isCorrect: nextCorrect,
+          evaluationState: nextCorrect ? 'pass' : 'fail'
         };
       }
       return next;
@@ -437,7 +486,8 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
         if (next[index]) {
           next[index] = {
             ...next[index],
-            isCorrect: newlyCorrect
+            isCorrect: newlyCorrect,
+            evaluationState: newlyCorrect ? 'pass' : 'fail'
           };
         }
         return next;
@@ -659,48 +709,74 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
           Nội dung này do giáo viên tự biên soạn.
         </div>
 
-        {/* 3. LIGHT PINK BANNER (HỒNG NHẠT) */}
-        <div className="bg-rose-50/80 border border-rose-200 rounded-2xl p-4 sm:p-5 space-y-3">
-          <h4 className="text-base font-black text-rose-900">
-            {studentName} đã hoàn thành {mode === 'assignment' ? 'bài tập' : 'bài kiểm tra'} này!
-          </h4>
-
-          <div className="space-y-1.5 text-xs text-rose-900/90 font-medium">
-            <p>
-              <strong className="text-rose-950 font-bold">Số câu đúng:</strong>{' '}
-              <span className="font-extrabold text-rose-700">{stats.correctCount}/{stats.totalCount}</span>
-            </p>
-            <p>
-              <strong className="text-rose-950 font-bold">Tổng số câu hỏi:</strong>{' '}
-              <span>{stats.totalCount}</span>
-            </p>
-
-            {isSubjectWithScore(targetItem?.subject) ? (
-              <>
-                <p>
-                  <strong className="text-rose-950 font-bold">Điểm {mode === 'assignment' ? 'bài tập' : 'bài thi'}:</strong>{' '}
-                  <span className="text-rose-600 font-extrabold">{stats.calculatedScore}</span>
-                </p>
-                <p>
-                  <strong className="text-rose-950 font-bold">Điểm thang 10:</strong>{' '}
-                  <span className="text-rose-600 font-black text-sm">{stats.scoreOutOf10}</span>
-                </p>
-              </>
-            ) : (
+        {/* 3. LIGHT PINK / NEUTRAL BANNER */}
+        {isWaitingStudent && !hasChanges ? (
+          <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 sm:p-5 space-y-2.5">
+            <h4 className="text-base font-black text-slate-800">
+              {studentName} chưa có bài làm (Trạng thái: Chờ HS)
+            </h4>
+            <div className="space-y-1.5 text-xs text-slate-600 font-medium">
               <p>
-                <strong className="text-rose-950 font-bold">Mức đánh giá:</strong>{' '}
-                <span className="font-extrabold text-emerald-700">
-                  {getQualitativeLabel(stats.correctCount, stats.totalCount)}
-                </span>
+                <strong className="text-slate-800 font-bold">Số câu đúng:</strong>{' '}
+                <span>- / {stats.totalCount}</span>
               </p>
-            )}
-
-            <p>
-              <strong className="text-rose-950 font-bold">Thời gian nộp bài:</strong>{' '}
-              <span>{formatSubmissionDateTime(submittedTime)}</span>
-            </p>
+              <p>
+                <strong className="text-slate-800 font-bold">Tổng số câu hỏi:</strong>{' '}
+                <span>{stats.totalCount}</span>
+              </p>
+              <p>
+                <strong className="text-slate-800 font-bold">Tổng điểm:</strong>{' '}
+                <span className="font-extrabold text-slate-500">-</span>
+              </p>
+              <p>
+                <strong className="text-slate-800 font-bold">Thời gian nộp bài:</strong>{' '}
+                <span className="px-2 py-0.5 rounded bg-rose-50 border border-rose-200 text-rose-600 font-bold text-[10px]">Chờ HS</span>
+              </p>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="bg-rose-50/80 border border-rose-200 rounded-2xl p-4 sm:p-5 space-y-3">
+            <h4 className="text-base font-black text-rose-900">
+              {studentName} đã hoàn thành {mode === 'assignment' ? 'bài tập' : 'bài kiểm tra'} này!
+            </h4>
+
+            <div className="space-y-1.5 text-xs text-rose-900/90 font-medium">
+              <p>
+                <strong className="text-rose-950 font-bold">Số câu đúng:</strong>{' '}
+                <span className="font-extrabold text-rose-700">{stats.correctCount}/{stats.totalCount}</span>
+              </p>
+              <p>
+                <strong className="text-rose-950 font-bold">Tổng số câu hỏi:</strong>{' '}
+                <span>{stats.totalCount}</span>
+              </p>
+
+              {isSubjectWithScore(targetItem?.subject) ? (
+                <>
+                  <p>
+                    <strong className="text-rose-950 font-bold">Điểm {mode === 'assignment' ? 'bài tập' : 'bài thi'}:</strong>{' '}
+                    <span className="text-rose-600 font-extrabold">{stats.calculatedScore}</span>
+                  </p>
+                  <p>
+                    <strong className="text-rose-950 font-bold">Điểm thang 10:</strong>{' '}
+                    <span className="text-rose-600 font-black text-sm">{stats.scoreOutOf10}</span>
+                  </p>
+                </>
+              ) : (
+                <p>
+                  <strong className="text-rose-950 font-bold">Mức đánh giá:</strong>{' '}
+                  <span className="font-extrabold text-emerald-700">
+                    {getQualitativeLabel(stats.correctCount, stats.totalCount)}
+                  </span>
+                </p>
+              )}
+
+              <p>
+                <strong className="text-rose-950 font-bold">Thời gian nộp bài:</strong>{' '}
+                <span>{formatSubmissionDateTime(submittedTime)}</span>
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* 4. THÔNG BÁO LƯU THÀNH CÔNG / LỖI THAO TÁC */}
         {saveSuccessMsg && (
@@ -777,7 +853,13 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                         key={e.questionIndex} 
                         className="py-2.5 px-3 font-extrabold text-slate-800 border-r border-slate-200"
                       >
-                        {e.isCorrect ? formatScore(e.points) : '0'}
+                        {e.evaluationState === 'none' ? (
+                          <span className="text-slate-300 font-semibold">-</span>
+                        ) : e.isCorrect ? (
+                          formatScore(e.points)
+                        ) : (
+                          '0'
+                        )}
                       </td>
                     ))}
                   </tr>
@@ -787,7 +869,9 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                     </td>
                     {evaluations.map((e) => (
                       <td key={e.questionIndex} className="py-2.5 px-3 border-r last:border-r-0 border-slate-200">
-                        {e.isCorrect ? (
+                        {e.evaluationState === 'none' ? (
+                          <span className="text-slate-300 font-semibold">-</span>
+                        ) : e.isCorrect ? (
                           <span className="inline-flex w-5 h-5 rounded-full bg-emerald-100 border border-emerald-300 text-emerald-700 items-center justify-center text-[10px] font-black">
                             ✓
                           </span>
@@ -814,6 +898,7 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                 const qIdx = evalItem.questionIndex;
                 const qType = normalizeQuestionType(q.type);
                 const isPass = evalItem.isCorrect;
+                const evalState = evalItem.evaluationState;
                 const studentChoice = evalItem.studentChoice;
                 const isAnswered = evalItem.isAnswered;
 
@@ -825,7 +910,13 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                     {/* Header câu hỏi: Số thứ tự, Điểm và Nút Đổi Đúng / Sai */}
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
-                        <span className={`font-extrabold text-xs ${isPass ? 'text-emerald-700' : 'text-rose-700'}`}>
+                        <span className={`font-extrabold text-xs ${
+                          evalState === 'none'
+                            ? 'text-slate-600'
+                            : isPass
+                              ? 'text-emerald-700'
+                              : 'text-rose-700'
+                        }`}>
                           Câu {qIdx + 1} ({formatScore(evalItem.points)}đ):
                         </span>
 
@@ -834,14 +925,16 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                           type="button"
                           onClick={() => handleToggleQuestionStatus(qIdx)}
                           className={`px-3 py-1 rounded-lg text-xs font-bold border flex items-center gap-1.5 cursor-pointer transition-all active:scale-95 ${
-                            isPass 
-                              ? 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200' 
-                              : 'bg-rose-100 text-rose-800 border-rose-300 hover:bg-rose-200'
+                            evalState === 'none'
+                              ? 'bg-slate-100 text-slate-600 border-slate-300 hover:bg-slate-200'
+                              : isPass 
+                                ? 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200' 
+                                : 'bg-rose-100 text-rose-800 border-rose-300 hover:bg-rose-200'
                           }`}
                           title="Bấm để đổi kết quả Đúng / Sai câu này"
                         >
                           <Edit3 className="w-3.5 h-3.5" />
-                          <span>{isPass ? '✓ Đúng' : '✗ Sai'}</span>
+                          <span>{evalState === 'none' ? 'Chưa làm' : isPass ? '✓ Đúng' : '✗ Sai'}</span>
                           <span className="text-[10px] opacity-75 font-normal">(Bấm để đổi)</span>
                         </button>
 
