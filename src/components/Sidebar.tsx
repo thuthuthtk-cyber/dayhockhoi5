@@ -24,7 +24,8 @@ import {
   TeacherRecord
 } from '../services/teacherStorageService';
 import { getCurrentStudentSession } from '../services/studentSessionService';
-import { useClassesList } from '../services/classStorageService';
+import { normalizeStudentCode } from '../services/studentCode';
+import { isAdmin } from '../utils/permissions';
 import { StudentProfileModal } from './modals/StudentProfileModal';
 
 export function resolveUserDisplayName(
@@ -72,11 +73,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onLogout,
   onSwitchRole
 }) => {
-  const { getClassesForGrade } = useClassesList();
-  const grade5ClassesList = getClassesForGrade('Khối 5').map((c) => c.name);
-  const quickSwitchClasses = grade5ClassesList.length > 0 ? grade5ClassesList : ['Lớp 5C', 'Lớp 5D'];
-  const defaultQuickClass = quickSwitchClasses[0] || 'Lớp 5C';
-
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(auth?.currentUser || null);
   const [teachersList, setTeachersList] = useState<TeacherRecord[]>(() => getTeachersFromLocalStorage());
   const [isStudentProfileModalOpen, setIsStudentProfileModalOpen] = useState(false);
@@ -304,11 +300,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
     'U'
   ).toUpperCase();
 
-  // Student specific data
+  // Student specific data (read-only class bound to studentCode session)
   const activeStudent = effectiveStudent || currentStudent;
-  const studentName = activeStudent?.name || activeStudent?.fullName || propUserName || `Học sinh ${defaultQuickClass}`;
-  const rawStudentClass = activeStudent?.className || currentClass || defaultQuickClass;
-  const cleanStudentClass = rawStudentClass.startsWith('Lớp') ? rawStudentClass : `Lớp ${rawStudentClass}`;
+  const activeStudentCode = normalizeStudentCode(activeStudent?.studentCode || activeStudent?.code);
+  const studentName = activeStudent?.name || activeStudent?.fullName || propUserName || 'Học sinh Khối 5';
+  const rawStudentClass = (
+    activeStudent?.className ||
+    (activeStudent as any)?.class ||
+    currentClass ||
+    ''
+  ).trim();
+  const cleanStudentClass = rawStudentClass
+    ? /^Lớp\b/i.test(rawStudentClass)
+      ? rawStudentClass
+      : `Lớp ${rawStudentClass}`
+    : 'Khối 5';
   const studentCoins = activeStudent?.coins ?? 1000;
 
   // Render avatar supporting animal SVG, custom image, or fallback
@@ -392,44 +398,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div className="w-8 h-8 rounded-full bg-indigo-50 border border-indigo-200 flex items-center justify-center p-0.5 shrink-0 overflow-hidden">
                   {renderStudentAvatarElement('w-7 h-7')}
                 </div>
-                <div className="hidden md:flex flex-col items-start min-w-0 text-left">
-                  <div className="flex items-center gap-1 max-w-[150px]">
+                <div className="flex flex-col items-start min-w-0 text-left">
+                  <div className="flex items-center gap-1 max-w-[115px] sm:max-w-[160px]">
                     <span className="text-xs font-semibold text-slate-900 truncate leading-tight">
                       {studentName}
                     </span>
                     <SquarePen className="w-3 h-3 text-slate-400 shrink-0" />
                   </div>
-                  <div className="flex items-center gap-1.5 text-[11px] leading-tight mt-0.5">
+                  <div
+                    className="flex items-center gap-1.5 text-[11px] leading-tight mt-0.5"
+                    title={activeStudentCode ? `Mã HS: ${activeStudentCode}` : undefined}
+                  >
                     <span className="font-semibold text-indigo-700">{cleanStudentClass}</span>
-                    <span className="text-slate-300">•</span>
-                    <span className="inline-flex items-center gap-0.5 font-bold text-amber-600 tabular-nums">
+                    <span className="text-slate-300 hidden sm:inline">•</span>
+                    <span className="hidden sm:inline-flex items-center gap-0.5 font-bold text-amber-600 tabular-nums">
                       <Coins className="w-3 h-3 text-amber-500 shrink-0" />
                       <span>{studentCoins.toLocaleString('vi-VN')} xu</span>
                     </span>
                   </div>
                 </div>
               </button>
-
-              {/* Quick Grade 5 Class Switcher */}
-              <div className="hidden sm:flex items-center bg-slate-100 rounded-lg p-0.5 border border-slate-200">
-                {quickSwitchClasses.slice(0, 4).map((cls) => {
-                  const isClsActive = cleanStudentClass.toUpperCase() === cls.toUpperCase();
-                  return (
-                    <button
-                      key={cls}
-                      type="button"
-                      onClick={() => onSwitchRole?.('student', cls)}
-                      className={`px-2 py-1 rounded-md text-[11px] font-bold transition-colors cursor-pointer ${
-                        isClsActive
-                          ? 'bg-white text-[#4F46E5] shadow-2xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      {cls.replace('Lớp ', '')}
-                    </button>
-                  );
-                })}
-              </div>
 
               {onSwitchRole && (
                 <button
@@ -497,7 +485,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   }
 
   // Teacher / Admin Horizontal Topbar Navigation
-  const isAdminAccount = userRole === 'admin' || effectiveTeacherRole === 'admin';
+  const isAdminAccount =
+    isAdmin(teacherProfile) ||
+    isAdmin(userRole) ||
+    isAdmin({ email: effectiveTeacherEmail, userRole: effectiveTeacherRole });
 
   return (
     <div className="sticky top-0 z-30 w-full bg-white/95 backdrop-blur-md border-b border-slate-200/90 shadow-xs">
@@ -584,7 +575,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {onSwitchRole && (
             <button
               type="button"
-              onClick={() => onSwitchRole('student', defaultQuickClass)}
+              onClick={() => onSwitchRole('student')}
               className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100 text-[#4338CA] transition-colors text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
               title="Chuyển sang giao diện Học sinh Khối 5"
             >
